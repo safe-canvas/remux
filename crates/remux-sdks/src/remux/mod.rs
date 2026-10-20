@@ -1546,8 +1546,13 @@ pub struct GetItemsQuery {
     #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
     pub has_trailer: Option<bool>,
     pub adjacent_to: Option<String>,
+    pub season: Option<i64>,
+    pub parent_index_number: Option<i64>,
     pub index_number: Option<i64>,
     pub start_index: Option<u32>,
+    /// Defaults to [`DEFAULT_ITEMS_LIMIT`] when a request omits it, so a bare
+    /// `/items` cannot load the whole library.
+    #[serde(default = "default_items_limit")]
     pub limit: Option<u32>,
     pub search_term: Option<String>,
     /// Emby `AnyProviderIdEquals` — `Tmdb.123,Imdb.tt456,Tvdb.789`.
@@ -1747,6 +1752,20 @@ pub struct GetItemsQuery {
     /// Regular Jellyfin clients never send this; it is used by the admin dashboard.
     #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
     pub include_childless: Option<bool>,
+}
+
+impl GetItemsQuery {
+    /// The favorite constraint, from `IsFavorite=` or `Filters=IsFavorite`.
+    pub fn favorite(&self) -> Option<bool> {
+        self.is_favorite
+            .or_else(|| {
+                self.filters
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .contains(&ItemFilter::IsFavorite)
+                    .then_some(true)
+            })
+    }
 }
 
 impl GetItemsQuery {
@@ -3491,6 +3510,34 @@ pub struct UserPolicy {
     #[serde(default, deserialize_with = "deserialize_optional_with_default")]
     #[default(SyncPlayUserAccessType::None)]
     pub sync_play_access: SyncPlayUserAccessType,
+}
+
+impl UserPolicy {
+    /// Whether this policy hides any content from the user: filter rules, a
+    /// parental rating limit, or blocked/allowed tags. `CollectionId` rules
+    /// only hide collection rows, not content, so they don't count.
+    pub fn restricts_content(&self) -> bool {
+        self.filter_rules
+            .iter()
+            .flat_map(|f| &f.groups)
+            .flat_map(|g| &g.rules)
+            .any(|r| !matches!(r, FilterRule::CollectionId { .. }))
+            || self
+                .max_parental_rating
+                .is_some()
+            || !self
+                .blocked_tags
+                .is_empty()
+            || !self
+                .allowed_tags
+                .is_empty()
+    }
+}
+
+pub const DEFAULT_ITEMS_LIMIT: u32 = 250;
+
+fn default_items_limit() -> Option<u32> {
+    Some(DEFAULT_ITEMS_LIMIT)
 }
 
 fn default_true() -> bool {
@@ -7357,6 +7404,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn items_query_limit_defaults_only_when_omitted() {
+        let omitted: GetItemsQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.limit, Some(DEFAULT_ITEMS_LIMIT));
+
+        let explicit: GetItemsQuery = serde_json::from_str(r#"{"Limit":7}"#).unwrap();
+        assert_eq!(explicit.limit, Some(7));
+
+        // Internal constructions are not limited.
+        assert_eq!(GetItemsQuery::default().limit, None);
+    }
+
+    #[test]
     fn branding_defaults_to_elegantfin_stylesheets() {
         let css = BrandingOptions::default()
             .custom_css
@@ -7400,6 +7459,14 @@ mod tests {
             .unwrap();
         assert_eq!(ids.tmdb, vec![27205]);
         assert_eq!(ids.imdb, vec!["tt1375666".to_string()]);
+    }
+
+    #[test]
+    fn get_items_query_deserializes_season_case_variants() {
+        for query in ["Season=2", "season=2"] {
+            let q: GetItemsQuery = serde_urlencoded::from_str(query).unwrap();
+            assert_eq!(q.season, Some(2));
+        }
     }
 
     #[test]

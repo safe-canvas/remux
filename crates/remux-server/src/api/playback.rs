@@ -43,6 +43,7 @@ use crate::{
 use crate::{
     IntoApiError, OptionExt, ResultExt,
     device_profile::{DeviceProfileExt, SourceRankingContext, SubtitleCodec},
+    errors::LogErr,
     playback::{
         decision::{
             PlaybackConfig, PlaybackPermissions, TranscodeDecision,
@@ -64,6 +65,9 @@ use axum_anyhow::ApiResult as Result;
 struct SourceExtras {
     /// The source id its DeliveryUrls were built with, and its sidecar routes.
     subtitle_routes: (Uuid, Vec<SidecarSubtitleRoute>),
+    /// Addon subtitles fetched for this source's release, before language
+    /// capping and dedup.
+    external_subtitles: Vec<crate::addons::SubtitleInfo>,
     /// The candidate stream as listed.
     stream_id: Uuid,
     /// The stream probed for the candidate; differs from `stream_id` after a
@@ -200,15 +204,10 @@ fn apply_item_runtime_fallback(
 }
 
 fn playback_original_language(
-    item: Option<&db::Media>,
+    item_language: Option<String>,
     selected_source_language: Option<String>,
 ) -> Option<String> {
-    item.and_then(|media| {
-        media
-            .original_language
-            .clone()
-    })
-    .or(selected_source_language)
+    item_language.or(selected_source_language)
 }
 
 async fn items_playbackinfo_inner(
@@ -311,6 +310,28 @@ async fn items_playbackinfo_inner(
         MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
             .await?
             .context_not_found("not found")?;
+    // The source that will play must be allowed, and so must the title in the
+    // URL when a MediaSourceId names something else (another title or one of
+    // its streams).
+    let title = match media_source_id {
+        Some(source_id) if source_id != id => {
+            MediaResolveService::resolve_item(id, &state.ctx).await?
+        }
+        _ => None,
+    };
+    for checked in std::iter::once(&media).chain(&title) {
+        if checked
+            .is_hidden_by_policy(
+                &state
+                    .ctx
+                    .db,
+                &session.user,
+            )
+            .await?
+        {
+            return Err(anyhow!("not found").context_not_found("not found"));
+        }
+    }
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
@@ -346,8 +367,15 @@ async fn items_playbackinfo_inner(
     }
     let is_track_item = media.is_track();
     let selected_source_language = media
-        .original_language
-        .clone();
+        .inherited_original_language(
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .log_err("failed to load inherited original language")
+        .ok()
+        .flatten();
 
     let max_bitrate: Option<i64> = match (
         q.max_streaming_bitrate,
@@ -463,7 +491,9 @@ async fn items_playbackinfo_inner(
     let subtitle_media_hint = media_source_id
         .is_none()
         .then(|| media.clone());
-    let (probed, (subtitle_media, external_subtitles)) = tokio::join!(
+    // Addon subtitles are fetched per source inside `probe_candidates`,
+    // alongside that source's probe, so only the item itself is loaded here.
+    let (probed, subtitle_media) = tokio::join!(
         async {
             service
                 .load(media)
@@ -474,9 +504,8 @@ async fn items_playbackinfo_inner(
         },
         async {
             // `id` is the top-level Movie/Episode UUID even when the request
-            // targets a child source. Fetch subtitle addons while stream addons
-            // load and their candidates are probed.
-            let mut subtitle_media = match subtitle_media_hint {
+            // targets a child source.
+            match subtitle_media_hint {
                 Some(hint) => Some(hint),
                 None => db::Media::get_by_id(
                     &state
@@ -487,36 +516,30 @@ async fn items_playbackinfo_inner(
                 .await
                 .ok()
                 .flatten(),
-            };
-            let external_subtitles = if is_live {
-                Vec::new()
-            } else if let Some(ref mut sub_media) = subtitle_media {
-                state
-                    .ctx
-                    .addons
-                    .fetch_subtitles(
-                        sub_media,
-                        &state.ctx,
-                        false,
-                        Some(
-                            session
-                                .user
-                                .id,
-                        ),
-                    )
-                    .await
-            } else {
-                Vec::new()
-            };
-            (subtitle_media, external_subtitles)
+            }
         }
     );
     let probed = probed?;
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
+    // Without a media_source_id, `subtitle_media` is `media`, whose language
+    // is already in `selected_source_language`.
+    let item_language = match &subtitle_media {
+        Some(item) if media_source_id.is_some() => item
+            .inherited_original_language(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await
+            .log_err("failed to load inherited original language")
+            .ok()
+            .flatten(),
+        _ => None,
+    };
     let original_language =
-        playback_original_language(subtitle_media.as_ref(), selected_source_language);
+        playback_original_language(item_language, selected_source_language);
     let is_track = is_track_item
         || subtitle_media
             .as_ref()
@@ -539,6 +562,7 @@ async fn items_playbackinfo_inner(
         stream,
         effective_stream,
         allow_subtitle_extraction,
+        external_subtitles,
     } in probed.results
     {
         // Metadata-only torrent probes may not know the container duration yet.
@@ -827,6 +851,7 @@ async fn items_playbackinfo_inner(
 
         source_extras.push(SourceExtras {
             subtitle_routes: (subtitle_source_id, routes),
+            external_subtitles,
             stream_id: stream.id,
             effective_stream_id: effective_stream.id,
             subtitle_prefetch,
@@ -834,23 +859,29 @@ async fn items_playbackinfo_inner(
         media_sources.push(source);
     }
 
-    // Probe and subtitle lookup ran concurrently. Append only after the real
-    // stream indexes are known.
-    append_external_subtitles(
-        &mut media_sources,
-        &external_subtitles,
-        &probe_cfg
-            .subtitle_languages
-            .clone()
-            .unwrap_or_default(),
-        sort_device_profile.as_ref(),
-        id,
-        session
-            .device
-            .access_token
-            .expose(),
-        subtitle_dedup,
-    );
+    // Append only after the real stream indexes are known. Each source gets
+    // the subtitles fetched for its own release.
+    let subtitle_languages = probe_cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
+    for (source, extras) in media_sources
+        .iter_mut()
+        .zip(&source_extras)
+    {
+        append_external_subtitles(
+            std::slice::from_mut(source),
+            &extras.external_subtitles,
+            &subtitle_languages,
+            sort_device_profile.as_ref(),
+            id,
+            session
+                .device
+                .access_token
+                .expose(),
+            subtitle_dedup,
+        );
+    }
 
     // Re-resolve defaults after external subtitles were injected so language
     // matching can also pick addon subtitles (same request context as the
@@ -936,6 +967,17 @@ async fn items_playbackinfo_inner(
         .zip(source_extras)
     {
         let (delivery_source_id, routes) = extras.subtitle_routes;
+        // Subtitle URLs carry this id and no PlaySessionId, so the device's
+        // selection must be findable under it, refreshed for this answer.
+        StreamService::save_device_selection(
+            &state.ctx,
+            &session
+                .device
+                .id,
+            id,
+            delivery_source_id,
+            extras.effective_stream_id,
+        );
         // DeliveryUrl contains the source ID from apply_subtitle_delivery, while
         // some clients construct the route from the final MediaSourceInfo ID.
         // Cache both keys when auto-play rewrites the first source ID.
@@ -1138,7 +1180,7 @@ pub async fn items_file(
 /// without a `PlaySessionId`/`DeviceId`, and must still work with no token at
 /// all. Resolve the caller's user and device best-effort from whatever
 /// `ApiKey`/`Token` is present (never rejecting the request) so per-device
-/// cache scoping (e.g. `recent_selected_stream_for`) still works when a valid
+/// cache scoping (e.g. `device_selected_stream_for`) still works when a valid
 /// token happens to be there. An API key resolves to the same synthetic
 /// `apikey-<token>` device `AuthSession` gives it, so a session-less stream
 /// request finds the selection PlaybackInfo saved under that device.
@@ -1355,6 +1397,21 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
+    // Refuse streams of a title the user's policy hides. A request without a
+    // token has no known user, so there is nothing to check it against.
+    if let Some(user) = &user {
+        if media
+            .is_hidden_by_policy(
+                &state
+                    .ctx
+                    .db,
+                user,
+            )
+            .await?
+        {
+            return Err(anyhow!("not found").context_not_found("not found"));
+        }
+    }
     let Some(si) = media
         .stream_info
         .clone()
@@ -2250,17 +2307,15 @@ mod tests {
 
     #[test]
     fn parent_item_language_overrides_missing_or_stale_source_language() {
-        let parent = crate::db::Media {
-            original_language: Some("en".to_string()),
-            ..Default::default()
-        };
-
         assert_eq!(
-            super::playback_original_language(Some(&parent), None),
+            super::playback_original_language(Some("en".to_string()), None),
             Some("en".to_string())
         );
         assert_eq!(
-            super::playback_original_language(Some(&parent), Some("ru".to_string())),
+            super::playback_original_language(
+                Some("en".to_string()),
+                Some("ru".to_string())
+            ),
             Some("en".to_string())
         );
         assert_eq!(
@@ -4196,6 +4251,105 @@ mod tests {
         );
     }
 
+    /// An episode without its own original_language inherits the series' for PlayDefaultAudioTrack.
+    #[tokio::test]
+    async fn test_play_default_audio_track_inherits_series_original_language() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+
+        let episode = crate::integration_test::seed_episode(ctx).await;
+        sqlx::query("UPDATE media SET original_language = 'en' WHERE id = ?")
+            .bind(episode.grandparent_id)
+            .execute(&ctx.db)
+            .await
+            .expect("set series original_language");
+        // Mark streams fresh so refresh_streams doesn't replace the fixture source.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now - chrono::Duration::seconds(30))
+            .bind(episode.id)
+            .execute(&ctx.db)
+            .await
+            .expect("set streams_refreshed_at");
+
+        // French is the container default; English is the series' language.
+        let probe = MediaSourceInfo {
+            container: Some(VideoContainer::Mp4),
+            media_streams: vec![
+                MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    index: 0,
+                    language: Some("fre".to_string()),
+                    is_default: Some(true),
+                    ..Default::default()
+                },
+                MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    index: 1,
+                    language: Some("eng".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut source = db::Media {
+            title: "1080p".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(episode.id),
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Local(
+                    "test-fixture-episode-orig-lang.mp4".into(),
+                ),
+                ..Default::default()
+            }),
+            probe_data: Some(probe),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        source
+            .save(&ctx.db)
+            .await
+            .expect("save source");
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", episode.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
+            Some(1),
+            "PlaybackInfo"
+        );
+
+        let resp = server
+            .get(&format!("/items/{}", episode.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
+            Some(1),
+            "item details"
+        );
+    }
+
     /// After reporting progress with `AudioStreamIndex=2`, the next PlaybackInfo
     /// request should recall that selection as `DefaultAudioStreamIndex`.
     #[tokio::test]
@@ -5067,5 +5221,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A title the user's policy hides can't be streamed, not even through an
+    /// allowed title's PlaybackInfo that names the hidden stream as its source.
+    #[tokio::test]
+    async fn policy_hidden_title_cannot_be_streamed() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db, stream,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let set_age_limit = |age: i32| async move {
+            let mut user = db::User::get_by_username(db, "test")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut policy = user
+                .policy
+                .map(|p| p.0)
+                .unwrap_or_default();
+            policy.max_parental_rating = Some(age);
+            user.policy = Some(sqlx::types::Json(policy));
+            user.save(db)
+                .await
+                .unwrap();
+        };
+
+        let movie = |title: &str, age: i32, tmdb: i64| db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Movie,
+            certification_age: Some(age),
+            external_ids: db::ExternalIds {
+                tmdb: Some(tmdb),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut allowed = movie("Family Movie", 0, 9000001);
+        let mut hidden = movie("Restricted Movie", 16, 9000002);
+        allowed
+            .save(db)
+            .await
+            .unwrap();
+        hidden
+            .save(db)
+            .await
+            .unwrap();
+        let fixture = std::env::temp_dir()
+            .join(format!("remux-policy-{}.mkv", uuid::Uuid::new_v4()));
+        tokio::fs::write(&fixture, b"0123456789abcdef")
+            .await
+            .unwrap();
+        let mut hidden_stream = db::Media {
+            kind: db::MediaKind::Stream,
+            parent_id: Some(hidden.id),
+            stream_info: Some(stream::StreamInfo {
+                descriptor: stream::StreamDescriptor::Local(fixture.clone()),
+                ..Default::default()
+            }),
+            probe_data: Some(MediaSourceInfo {
+                container: Some(VideoContainer::Mkv),
+                media_streams: vec![
+                    MediaStream {
+                        codec: Some("h264".to_string()),
+                        type_: Some(MediaStreamType::Video),
+                        index: 0,
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(MediaStreamType::Audio),
+                        index: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        hidden_stream
+            .save(db)
+            .await
+            .unwrap();
+        let stream_path = format!("/videos/{}/stream.mkv", hidden_stream.id);
+        let playback_info = |source: uuid::Uuid| {
+            server
+                .post(&format!("/items/{}/playbackinfo", allowed.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({ "MediaSourceId": source }))
+        };
+
+        set_age_limit(0).await;
+        playback_info(hidden_stream.id)
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+        server
+            .get(&stream_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // Once the limit allows the title, the same requests succeed.
+        set_age_limit(16).await;
+        playback_info(hidden_stream.id)
+            .await
+            .assert_status_ok();
+        server
+            .get(&stream_path)
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .add_header(http::header::RANGE, HeaderValue::from_static("bytes=4-7"))
+            .await
+            .assert_status(StatusCode::PARTIAL_CONTENT);
+
+        let _ = tokio::fs::remove_file(fixture).await;
     }
 }

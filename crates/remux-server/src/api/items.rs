@@ -497,7 +497,11 @@ pub async fn get_items(
             let remaining = relations
                 .len()
                 .saturating_sub(start);
-            let slice = match q.limit {
+            // Jellyfin returns the whole playlist unless the client sets a limit.
+            let limit = q
+                .limit
+                .filter(|l| *l != api::DEFAULT_ITEMS_LIMIT);
+            let slice = match limit {
                 Some(limit) => {
                     &relations[start.min(relations.len())..]
                         [..(limit as usize).min(remaining)]
@@ -921,6 +925,31 @@ pub async fn items(
     session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    // Jellyfin lists the root (the user's views) when nothing narrows the query,
+    // instead of walking the whole library.
+    if !q.recursive
+        && q.parent_id
+            .is_none()
+        && q.ids
+            .is_none()
+        && q.search_term
+            .is_none()
+        && q.include_item_types
+            .is_none()
+        && q.media_types
+            .is_none()
+    {
+        return Ok(super::users::userviews(
+            State(state),
+            session,
+            Query(super::users::UserViewsQuery {
+                include_hidden: None,
+            }),
+        )
+        .await?
+        .into_response());
+    }
+
     //trace!(?q);
     let items = get_items(state.clone(), session.clone(), q.clone(), true)
         .await?
@@ -941,7 +970,8 @@ pub async fn items(
             .start_index
             .unwrap_or_else(|| 0),
         ..Default::default()
-    }))
+    })
+    .into_response())
 }
 
 /// Return the virtual root folder
@@ -1049,7 +1079,7 @@ pub async fn refresh_item(
             .ok();
 
         if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
-            warm_providers_cache(&state.ctx, &media, None);
+            warm_providers_cache(&state.ctx, &media);
         }
     } else if q.metadata_refresh_mode == api::MetadataRefreshMode::FullRefresh {
         let force_refresh = q.replace_all_metadata;
@@ -1712,6 +1742,18 @@ async fn item_for_user(
     .into_iter()
     .next()
     .context_not_found("item not found")?;
+    // A title hidden from the user's library must not open by id either.
+    if media
+        .is_hidden_by_policy(
+            &state
+                .ctx
+                .db,
+            &session.user,
+        )
+        .await?
+    {
+        return Ok(None);
+    }
 
     db::Media::preload_playlist_runtimes(
         &state
@@ -1756,19 +1798,11 @@ async fn item_for_user(
 
     // Items detail itself never shows subtitles (embedded or addon external —
     // see the media_streams-stripping block below), but it still warms the
-    // subtitle addon cache in the background so the PlaybackInfo call that
-    // follows a few seconds later doesn't pay the cold-fetch cost.
+    // segment cache in the background so the PlaybackInfo call that follows a
+    // few seconds later doesn't pay the cold-fetch cost.
     if needs_streams {
         if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
-            warm_providers_cache(
-                &state.ctx,
-                &media,
-                Some(
-                    session
-                        .user
-                        .id,
-                ),
-            );
+            warm_providers_cache(&state.ctx, &media);
         }
         state
             .ctx
@@ -1799,6 +1833,21 @@ async fn item_for_user(
                 .is_empty()
         })
         .cloned();
+    // Same language PlaybackInfo uses, so DefaultAudioStreamIndex agrees.
+    let original_language = if want_streams {
+        media
+            .inherited_original_language(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await
+            .log_err("failed to load inherited original language")
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     if want_streams && media.kind == db::MediaKind::Stream {
         media.sources = Some(vec![media.clone()]);
     } else if want_streams
@@ -1886,9 +1935,7 @@ async fn item_for_user(
                     server_config
                         .preferred_metadata_language
                         .as_deref(),
-                    media
-                        .original_language
-                        .as_deref(),
+                    original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
                 )
@@ -1970,9 +2017,7 @@ async fn item_for_user(
                     server_config
                         .preferred_metadata_language
                         .as_deref(),
-                    media
-                        .original_language
-                        .as_deref(),
+                    original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
                 )
@@ -2078,9 +2123,7 @@ async fn item_for_user(
                     server_config
                         .preferred_metadata_language
                         .as_deref(),
-                    media
-                        .original_language
-                        .as_deref(),
+                    original_language.as_deref(),
                     None,
                     None,
                     remembered_audio,
@@ -2766,6 +2809,12 @@ pub async fn genres(
         .as_deref()
         .map(|f| f.contains(&api::ItemFields::ItemCounts))
         .unwrap_or(false);
+    let favorite = favorite_user_state(
+        &q,
+        session
+            .user
+            .id,
+    );
     let policy = session
         .user
         .policy
@@ -2802,6 +2851,7 @@ pub async fn genres(
             sort_order: q
                 .sort_order
                 .unwrap_or_default(),
+            user_state: favorite,
             title_contains: q.search_term,
             ..Default::default()
         },
@@ -2820,6 +2870,22 @@ pub async fn genres(
             .unwrap_or(0),
         ..Default::default()
     }))
+}
+
+/// Favorite filter for the name-list endpoints (`/Studios`, `/Genres`), which
+/// build their own `MediaFilter` instead of going through `get_items`. The
+/// web client's Favorites tab sends `IsFavorite=true` (or `Filters=IsFavorite`)
+/// to them; dropping it there lists every studio and genre as a favorite.
+pub fn favorite_user_state(
+    q: &api::GetItemsQuery,
+    user_id: Uuid,
+) -> Option<db::UserMediaStateFilter> {
+    let favorite = q.favorite()?;
+    Some(db::UserMediaStateFilter {
+        user_id: Some(user_id),
+        favorite: Some(favorite),
+        ..Default::default()
+    })
 }
 
 #[get("/musicgenres")]
@@ -3101,6 +3167,7 @@ pub async fn items_similar(
             .ctx
             .db,
         &id,
+        &session.user,
         limit,
         offset,
     )
@@ -3136,7 +3203,6 @@ pub async fn items_similar(
         &filter,
     )
     .await?;
-
     // Reorder results to match score order.
     let score_map: std::collections::HashMap<Uuid, i64> = scored_ids
         .into_iter()
@@ -3697,18 +3763,12 @@ pub async fn patch_item(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Background-warms the addon caches PlaybackInfo will hit right after this
-/// item is opened. `user_id` must be the real requester's — addon selection
-/// is user-scoped (`addons_for`), so warming under the wrong user (or `None`)
-/// populates a cache entry a real PlaybackInfo call will never read, making
-/// this a no-op in practice.
-fn warm_providers_cache(
-    ctx: &crate::AppContext,
-    media: &db::Media,
-    user_id: Option<Uuid>,
-) {
-    // Live TV sources do not have external subtitles, intro markers, or a
-    // parent metadata tree to warm. Avoid a pointless addon fan-out whenever
+/// Background-warms the caches PlaybackInfo will hit right after this item is
+/// opened. Subtitles aren't warmed: they're fetched per release while the
+/// stream is probed, so there's nothing item-level to warm.
+fn warm_providers_cache(ctx: &crate::AppContext, media: &db::Media) {
+    // Live TV sources do not have intro markers or a parent metadata tree to
+    // warm. Avoid a pointless addon fan-out whenever
     // a client opens a channel/program detail page.
     if media.is_live() {
         return;
@@ -3716,11 +3776,6 @@ fn warm_providers_cache(
     let mut media = media.clone();
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut subtitle_media = media.clone();
-        let _ = ctx
-            .addons
-            .fetch_subtitles(&mut subtitle_media, &ctx, true, user_id)
-            .await;
         let _ = media
             .grandparent(&ctx.db)
             .await;
@@ -4235,6 +4290,131 @@ mod tests {
 
         assert_eq!(names, vec!["Official Video"]);
         assert_eq!(response["TotalRecordCount"], 1);
+    }
+
+    /// Jellyfin web's Favorites tab asks `/Studios` and `/Genres` for
+    /// `IsFavorite=true`; both must return only the requester's favorites
+    /// rather than every studio/genre.
+    #[tokio::test]
+    async fn studios_and_genres_honor_is_favorite() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let requester = db::User::get_by_username(db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut other_user = db::User::new_with_password(
+            String::new(),
+            "other-user".into(),
+            "test",
+            None,
+        )
+        .unwrap();
+        other_user
+            .save(db)
+            .await
+            .unwrap();
+
+        let item =
+            insert_media(db, "Some Show", db::MediaKind::Series, "tt1000010").await;
+        let mut rows = Vec::new();
+        for (kind, names) in [
+            (db::MediaKind::Genre, ["Drama", "Comedy"]),
+            (db::MediaKind::Studio, ["Studio A", "Studio B"]),
+        ] {
+            let names: Vec<String> = names
+                .iter()
+                .map(|n| n.to_string())
+                .collect();
+            let pairs = db::build_genre_relations_from_names(item.id, &names, kind);
+            let media: Vec<_> = pairs
+                .iter()
+                .map(|(_, m)| m.clone())
+                .collect();
+            db::Media::upsert(db, &media)
+                .await
+                .unwrap();
+            rows.extend(media);
+        }
+        let row = |title: &str| {
+            rows.iter()
+                .find(|m| m.title == title)
+                .unwrap()
+                .clone()
+        };
+        for (user, title) in [
+            (&requester, "Drama"),
+            (&requester, "Studio A"),
+            (&other_user, "Comedy"),
+            (&other_user, "Studio B"),
+        ] {
+            let mut state = db::UserMediaState::get_or_new(db, user, &row(title))
+                .await
+                .unwrap();
+            state.favorite = true;
+            state
+                .save(db)
+                .await
+                .unwrap();
+        }
+
+        for (path, query, expected) in [
+            ("/genres", ("IsFavorite", "true"), "Drama"),
+            ("/genres", ("Filters", "IsFavorite"), "Drama"),
+            ("/studios", ("IsFavorite", "true"), "Studio A"),
+            ("/studios", ("Filters", "IsFavorite"), "Studio A"),
+        ] {
+            let response: serde_json::Value = server
+                .get(path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .add_query_param(query.0, query.1)
+                .await
+                .json();
+            let names: Vec<&str> = response["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["Name"].as_str())
+                .collect();
+            assert_eq!(names, vec![expected], "{path}?{}={}", query.0, query.1);
+            assert_eq!(response["TotalRecordCount"], 1);
+        }
+
+        let response: serde_json::Value = server
+            .get("/studios")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        assert_eq!(response["TotalRecordCount"], 2);
+
+        let response: serde_json::Value = server
+            .get("/studios")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_param("StartIndex", "1")
+            .add_query_param("Limit", "1")
+            .await
+            .json();
+        assert_eq!(
+            response["Items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(response["TotalRecordCount"], 2);
+        assert_eq!(response["StartIndex"], 1);
     }
 
     #[tokio::test]
@@ -5038,6 +5218,78 @@ mod tests {
                 .iter()
                 .any(|item| item["Id"].as_str() == Some(group_id.as_str())),
             "a group container with no sub-collections yet must still appear in /UserViews; got: {body}"
+        );
+    }
+
+    // Like Jellyfin, a bare /Items lists the root (the user's views), not the library.
+    #[tokio::test]
+    async fn bare_items_lists_user_views_unless_recursive() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let mut group = db::Media {
+            title: "Root view".to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Manual),
+            collection_media_kind: Some(db::CollectionMediaKind::Collection),
+            promoted: true,
+            ..Default::default()
+        };
+        group
+            .save(db)
+            .await
+            .unwrap();
+        let (id, external_ids) =
+            make_content_ids(db::MediaKind::Movie, "tt-bare-items");
+        let mut movie = db::Media {
+            id,
+            title: "Some movie".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids,
+            ..Default::default()
+        };
+        movie
+            .save(db)
+            .await
+            .unwrap();
+
+        let names = |body: &serde_json::Value| -> Vec<String> {
+            body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    i["Name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        };
+        let get = |path: &'static str| {
+            let req = server
+                .get(path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                );
+            async move {
+                req.await
+                    .json::<serde_json::Value>()
+            }
+        };
+
+        let bare = names(&get("/items").await);
+        assert!(bare.contains(&"Root view".to_string()), "got: {bare:?}");
+        assert!(!bare.contains(&"Some movie".to_string()), "got: {bare:?}");
+
+        let recursive = names(&get("/items?recursive=true").await);
+        assert!(
+            recursive.contains(&"Some movie".to_string()),
+            "got: {recursive:?}"
         );
     }
 
@@ -7221,5 +7473,198 @@ mod tests {
             .unwrap();
             assert_eq!(people, vec![person.id], "the old People must survive");
         }
+    }
+
+    async fn set_policy_filter(db: &sqlx::SqlitePool, filter: CollectionFilter) {
+        let mut user = db::User::get_by_username(db, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut policy = user
+            .policy
+            .map(|p| p.0)
+            .unwrap_or_default();
+        policy.filter_rules = Some(filter);
+        user.policy = Some(sqlx::types::Json(policy));
+        user.save(db)
+            .await
+            .unwrap();
+    }
+
+    /// What the policy hides from listings must not open, play or show up as
+    /// similar by id either (containers still open), and loosening the policy
+    /// brings it back.
+    #[tokio::test]
+    async fn policy_hidden_item_cannot_be_opened_or_played() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user_id = get_user_id(&server, &auth).await;
+        let mut movie =
+            insert_media(db, "Restricted Movie", db::MediaKind::Movie, "tt9000001")
+                .await;
+        movie.certification_age = Some(16);
+        movie
+            .save(db)
+            .await
+            .unwrap();
+        let mut allowed =
+            insert_media(db, "Allowed Movie", db::MediaKind::Movie, "tt9000002").await;
+        allowed.certification_age = Some(0);
+        allowed
+            .save(db)
+            .await
+            .unwrap();
+        add_genre(db, movie.id, "Drama").await;
+        add_genre(db, allowed.id, "Drama").await;
+        let collection = insert_smart_collection_with_filter(
+            db,
+            "Movies",
+            db::CollectionMediaKind::Movie,
+            None,
+        )
+        .await;
+        let get = |path: String| {
+            server
+                .get(&path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+        };
+        let similar_ids = |body: serde_json::Value| -> Vec<String> {
+            body["Items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i["Id"].as_str())
+                .map(str::to_string)
+                .collect()
+        };
+        let movie_id = movie
+            .id
+            .simple()
+            .to_string();
+
+        set_policy_filter(db, parental_rating_filter(0)).await;
+        let body = get(format!("/items/{}/similar", allowed.id))
+            .await
+            .json();
+        assert!(!similar_ids(body).contains(&movie_id));
+        for path in [
+            format!("/items/{}", movie.id),
+            format!("/users/{user_id}/items/{}", movie.id),
+            format!("/items/{}/playbackinfo", movie.id),
+        ] {
+            get(path)
+                .expect_failure()
+                .await
+                .assert_status(http::StatusCode::NOT_FOUND);
+        }
+        get(format!("/items/{}", collection.id))
+            .await
+            .assert_status_ok();
+
+        set_policy_filter(db, parental_rating_filter(16)).await;
+        get(format!("/items/{}", movie.id))
+            .await
+            .assert_status_ok();
+        let body = get(format!("/items/{}/similar", allowed.id))
+            .await
+            .json();
+        assert!(similar_ids(body).contains(&movie_id));
+
+        // Jellyfin's own parental control setting is enforced the same way.
+        set_max_parental_rating(db, 12).await;
+        get(format!("/items/{}", movie.id))
+            .expect_failure()
+            .await
+            .assert_status(http::StatusCode::NOT_FOUND);
+    }
+
+    /// Not just age: blocked tags, allowed tags and any other policy filter
+    /// rule (here genre) hide an item by id exactly like they hide it from
+    /// listings.
+    #[tokio::test]
+    async fn policy_tags_and_filter_rules_hide_items_by_id() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let tagged =
+            insert_media(db, "Tagged Movie", db::MediaKind::Movie, "tt9000003").await;
+        let drama =
+            insert_media(db, "Drama Movie", db::MediaKind::Movie, "tt9000004").await;
+        let other =
+            insert_media(db, "Other Movie", db::MediaKind::Movie, "tt9000005").await;
+        super::set_tags(db, tagged.id, &["blocked-tag".to_string()])
+            .await
+            .unwrap();
+        super::set_tags(db, other.id, &["allowed-tag".to_string()])
+            .await
+            .unwrap();
+        add_genre(db, drama.id, "Drama").await;
+
+        let set_policy = |change: fn(&mut crate::api::UserPolicy)| async move {
+            let mut user = db::User::get_by_username(db, "test")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut policy = crate::api::UserPolicy::default();
+            change(&mut policy);
+            user.policy = Some(sqlx::types::Json(policy));
+            user.save(db)
+                .await
+                .unwrap();
+        };
+        // Whether tagged / drama / other open by id.
+        let (server, auth) = (&server, &auth);
+        let assert_visible = |expected: [bool; 3]| async move {
+            for (id, visible) in [tagged.id, drama.id, other.id]
+                .into_iter()
+                .zip(expected)
+            {
+                let request = server
+                    .get(&format!("/items/{id}"))
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(auth).unwrap(),
+                    );
+                if visible {
+                    request
+                        .await
+                        .assert_status_ok();
+                } else {
+                    request
+                        .expect_failure()
+                        .await
+                        .assert_status(http::StatusCode::NOT_FOUND);
+                }
+            }
+        };
+
+        set_policy(|p| p.blocked_tags = vec!["blocked-tag".to_string()]).await;
+        assert_visible([false, true, true]).await;
+
+        set_policy(|p| p.allowed_tags = vec!["allowed-tag".to_string()]).await;
+        assert_visible([false, false, true]).await;
+
+        set_policy(|p| {
+            p.filter_rules = Some(CollectionFilter {
+                groups: vec![FilterGroup {
+                    rules: vec![FilterRule::Genre {
+                        op: SetOp::IsNot,
+                        values: vec!["Drama".to_string()],
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        })
+        .await;
+        assert_visible([true, false, true]).await;
     }
 }

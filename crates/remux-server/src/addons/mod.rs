@@ -518,8 +518,25 @@ fn series_is_active(status: &Option<db::MediaStatus>) -> bool {
     )
 }
 
+/// Whether an episode is still recent (or upcoming) enough to be re-fetched on
+/// every pass instead of only until it has been refreshed once.
+///
+/// The row coming out of a tree fetch is freshly parsed, so it usually has no
+/// `digital_released_at` (TMDB episodes only carry their air date in
+/// `released_at`). Look at the stored digital date first, then the fetched one,
+/// then the air date; an episode with no date at all is treated as active.
 fn episode_in_active_window(child: &db::Media) -> bool {
-    match child.digital_released_at {
+    episode_in_active_window_with(child, None)
+}
+
+fn episode_in_active_window_with(
+    child: &db::Media,
+    stored_digital: Option<chrono::NaiveDateTime>,
+) -> bool {
+    match stored_digital
+        .or(child.digital_released_at)
+        .or(child.released_at)
+    {
         None => true,
         Some(dt) => {
             let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(180);
@@ -835,12 +852,38 @@ pub struct SubtitleInfo {
     pub ai_translated: Option<bool>,
 }
 
+/// The release being played, so an addon can return subtitles made for that
+/// exact file instead of a generic list for the title. All fields are optional;
+/// addons that can't use them ignore the query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtitleQuery {
+    pub filename: Option<String>,
+    pub video_size: Option<i64>,
+}
+
+impl SubtitleQuery {
+    fn cache_suffix(&self) -> String {
+        if self == &Self::default() {
+            return String::new();
+        }
+        format!(
+            ":{}:{}",
+            self.filename
+                .as_deref()
+                .unwrap_or(""),
+            self.video_size
+                .map_or(String::new(), |size| size.to_string())
+        )
+    }
+}
+
 #[async_trait]
 pub trait SubtitleAddon: Send + Sync {
     fn supports(&self, media: &db::Media) -> bool;
     async fn subtitle_fetch(
         &self,
         media: &db::Media,
+        query: &SubtitleQuery,
         db: &SqlitePool,
     ) -> Result<Vec<SubtitleInfo>>;
 }
@@ -2540,7 +2583,11 @@ impl AddonService {
         // doc comment for why leaving it behind defeats child_refresh_force.
         let existing_l2: std::collections::HashMap<
             (Uuid, String, i64),
-            (Uuid, Option<chrono::NaiveDateTime>),
+            (
+                Uuid,
+                Option<chrono::NaiveDateTime>,
+                Option<chrono::NaiveDateTime>,
+            ),
         > = sqlx::query_as::<
             _,
             (
@@ -2549,9 +2596,10 @@ impl AddonService {
                 Option<i64>,
                 Uuid,
                 Option<chrono::NaiveDateTime>,
+                Option<chrono::NaiveDateTime>,
             ),
         >(
-            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at
+            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at, digital_released_at
              FROM media WHERE grandparent_id = ? AND idx IS NOT NULL",
         )
         .bind(actual_root_id)
@@ -2559,8 +2607,8 @@ impl AddonService {
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(pid, k, idx, id, refreshed_at)| {
-            idx.map(|i| ((pid, k, i), (id, refreshed_at)))
+        .filter_map(|(pid, k, idx, id, refreshed_at, digital)| {
+            idx.map(|i| ((pid, k, i), (id, refreshed_at, digital)))
         })
         .collect();
 
@@ -2715,6 +2763,7 @@ impl AddonService {
                         // has no concept of refreshed_at — without adopting it here too,
                         // child_refresh_force below always treats this episode as never
                         // refreshed, refetching it on every single pass.
+                        let mut stored_digital = None;
                         if let Some(idx) = gc.idx {
                             let key = (
                                 actual_child_id,
@@ -2722,17 +2771,21 @@ impl AddonService {
                                     .to_string(),
                                 idx,
                             );
-                            if let Some(&(existing_id, existing_refreshed_at)) =
-                                existing_l2.get(&key)
+                            if let Some(&(
+                                existing_id,
+                                existing_refreshed_at,
+                                existing_digital,
+                            )) = existing_l2.get(&key)
                             {
                                 gc.id = existing_id;
                                 gc.refreshed_at = existing_refreshed_at;
+                                stored_digital = existing_digital;
                             }
                         }
 
                         let in_active_window = is_continuing
                             && matches!(gc.kind, db::MediaKind::Episode)
-                            && episode_in_active_window(&gc);
+                            && episode_in_active_window_with(&gc, stored_digital);
                         if let Some(effective_force) =
                             child_refresh_force(force_refresh, in_active_window, &gc)
                         {
@@ -2897,15 +2950,20 @@ impl AddonService {
     /// Items detail fetch racing a PlaybackInfo call for the same item used
     /// to each pay the full addon fetch independently and concurrently.
     /// Cache the result briefly and serialize concurrent callers the same way.
+    /// `query` asks addons for subtitles made for one release; the default
+    /// query asks for the title's generic list. Each distinct query is cached
+    /// on its own.
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn fetch_subtitles(
         &self,
         media: &mut db::Media,
+        query: &SubtitleQuery,
         ctx: &AppContext,
         background: bool,
         user_id: Option<Uuid>,
     ) -> Vec<SubtitleInfo> {
         const SUBTITLES_TTL: Duration = Duration::from_secs(5 * 60);
+        const SUBTITLE_ADDON_TIMEOUT: Duration = Duration::from_secs(5);
         static SUBTITLE_LOCKS: KeyedLock<String> = KeyedLock::new();
 
         if media.kind == db::MediaKind::Episode {
@@ -2916,11 +2974,12 @@ impl AddonService {
         }
 
         let cache_key = format!(
-            "addon-subtitles:{}:{}",
+            "addon-subtitles:{}:{}{}",
             media.id,
             user_id
                 .map(|id| id.to_string())
-                .unwrap_or_else(|| "anon".to_string())
+                .unwrap_or_else(|| "anon".to_string()),
+            query.cache_suffix()
         );
         if let Some(cached) = ctx
             .store
@@ -2947,22 +3006,39 @@ impl AddonService {
 
         debug!(count = addons.len(), "subtitle addons matched");
         let instant = Instant::now();
+        // Addons are queried concurrently so the slowest one sets the wait
+        // instead of the sum, and each is capped so one hung addon can't
+        // stall playback. Results keep addon order.
+        let media_ref: &db::Media = media;
+        let fetched = futures::future::join_all(
+            addons
+                .iter()
+                .map(|r| async move {
+                    debug!(addon = %r.row.name, "fetching subtitles from addon");
+                    let result = tokio::time::timeout(
+                        SUBTITLE_ADDON_TIMEOUT,
+                        r.subtitle
+                            .as_ref()
+                            .unwrap()
+                            .subtitle_fetch(media_ref, query, &ctx.db),
+                    )
+                    .await;
+                    (r, result)
+                }),
+        )
+        .await;
         let mut subs = vec![];
-        for r in &addons {
-            debug!(addon = %r.row.name, "fetching subtitles from addon");
-            match r
-                .subtitle
-                .as_ref()
-                .unwrap()
-                .subtitle_fetch(media, &ctx.db)
-                .await
-            {
-                Ok(s) => {
+        for (r, result) in fetched {
+            match result {
+                Ok(Ok(s)) => {
                     debug!(addon = %r.row.name, count = s.len(), "subtitle addon returned results");
                     subs.extend(s);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(addon = %r.row.name, error = %e, "subtitle addon failed")
+                }
+                Err(_) => {
+                    warn!(addon = %r.row.name, timeout = ?SUBTITLE_ADDON_TIMEOUT, "subtitle addon timed out")
                 }
             }
         }
@@ -4053,6 +4129,52 @@ mod tests {
         assert!(!episode_in_active_window(&child));
     }
 
+    // A freshly fetched TMDB episode carries its air date in `released_at` and
+    // never a digital date, so an old episode must read as inactive from the
+    // air date alone, not be refreshed every night forever.
+    #[test]
+    fn old_air_date_without_digital_date_is_inactive() {
+        let child = db::Media {
+            released_at: Some(days_ago(400)),
+            ..Default::default()
+        };
+        assert!(!episode_in_active_window(&child));
+    }
+
+    #[test]
+    fn recent_air_date_without_digital_date_is_active() {
+        let child = db::Media {
+            released_at: Some(days_ago(10)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window(&child));
+    }
+
+    #[test]
+    fn upcoming_air_date_without_digital_date_is_active() {
+        let child = db::Media {
+            released_at: Some(days_from_now(7)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window(&child));
+    }
+
+    // The stored digital date wins over the freshly fetched row, which has none.
+    #[test]
+    fn stored_old_digital_date_makes_fresh_row_inactive() {
+        let child = db::Media::default();
+        assert!(!episode_in_active_window_with(&child, Some(days_ago(300))));
+    }
+
+    #[test]
+    fn stored_recent_digital_date_makes_fresh_row_active() {
+        let child = db::Media {
+            released_at: Some(days_ago(400)),
+            ..Default::default()
+        };
+        assert!(episode_in_active_window_with(&child, Some(days_ago(5))));
+    }
+
     // --- series_is_active ---
 
     #[test]
@@ -4456,6 +4578,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn subtitle_query_cache_suffix_keeps_default_keys_and_separates_releases() {
+        let release = |filename: &str, size| SubtitleQuery {
+            filename: Some(filename.into()),
+            video_size: size,
+        };
+        assert_eq!(SubtitleQuery::default().cache_suffix(), "");
+        assert_ne!(
+            release("a.mkv", Some(1)).cache_suffix(),
+            release("b.mkv", Some(1)).cache_suffix()
+        );
+        assert_ne!(
+            release("a.mkv", Some(1)).cache_suffix(),
+            release("a.mkv", Some(2)).cache_suffix()
+        );
+        assert_ne!(
+            release("a.mkv", None).cache_suffix(),
+            SubtitleQuery::default().cache_suffix()
+        );
+    }
+
     struct CountingSubtitleAddon {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -4469,6 +4612,7 @@ mod tests {
         async fn subtitle_fetch(
             &self,
             _media: &db::Media,
+            _query: &SubtitleQuery,
             _db: &SqlitePool,
         ) -> Result<Vec<SubtitleInfo>> {
             self.calls
@@ -4546,9 +4690,10 @@ mod tests {
         let mut media_b = media_a.clone();
         let user_id = uuid::Uuid::new_v4();
 
+        let query = SubtitleQuery::default();
         let (subs_a, subs_b) = tokio::join!(
-            service.fetch_subtitles(&mut media_a, &ctx, false, Some(user_id)),
-            service.fetch_subtitles(&mut media_b, &ctx, false, Some(user_id)),
+            service.fetch_subtitles(&mut media_a, &query, &ctx, false, Some(user_id),),
+            service.fetch_subtitles(&mut media_b, &query, &ctx, false, Some(user_id),),
         );
 
         assert_eq!(
@@ -4749,7 +4894,7 @@ mod tests {
         };
 
         service
-            .fetch_subtitles(&mut media, &ctx, false, None)
+            .fetch_subtitles(&mut media, &SubtitleQuery::default(), &ctx, false, None)
             .await;
 
         assert!(
