@@ -166,14 +166,20 @@ async fn load_saved_selections(
     db: &sqlx::SqlitePool,
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,
-) -> (Option<i64>, Option<i64>) {
+) -> (
+    Option<i64>,
+    Option<i64>,
+    remux_sdks::remux::RememberedLanguages,
+) {
     let media = crate::db::Media::get_by_id(db, media_id)
         .await
         .ok()
         .flatten();
     let Some(media) = media else {
-        return (None, None);
+        return (None, None, Default::default());
     };
+    let languages =
+        crate::db::UserMediaState::remembered_languages(db, user_id, &media.id).await;
     match sqlx::query_as::<_, crate::db::UserMediaState>(
         "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
     )
@@ -182,8 +188,8 @@ async fn load_saved_selections(
     .fetch_optional(db)
     .await
     {
-        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx),
-        _ => (None, None),
+        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx, languages),
+        _ => (None, None, languages),
     }
 }
 
@@ -216,6 +222,17 @@ async fn items_playbackinfo_inner(
     id: Uuid,
     mut q: api::PlaybackInfoQuery,
 ) -> Result<impl IntoResponse> {
+    if let Some(running) = StreamService::running_release(
+        &state.ctx,
+        &session
+            .device
+            .id,
+        id,
+        q.media_source_id,
+    ) {
+        debug!(%running, "PlaybackInfo stays on the release being played");
+        q.media_source_id = Some(running);
+    }
     let media_source_id = q.media_source_id;
 
     trace!(?id, ?q, "items_playbackinfo");
@@ -354,7 +371,11 @@ async fn items_playbackinfo_inner(
                 .id,
         ),
     });
-    let is_live = media.is_live();
+    // A pinned or picked stream is a child of the channel: the channel decides.
+    let is_live = media.is_live()
+        || title
+            .as_ref()
+            .is_some_and(|item| item.is_live());
 
     // A live channel's source is often an addon relay URL. It may be a valid
     // HLS stream, but browsers cannot reliably open it directly: redirects,
@@ -456,7 +477,7 @@ async fn items_playbackinfo_inner(
     let server_subtitle_lang = probe_cfg
         .preferred_metadata_language
         .as_deref();
-    let (saved_audio, saved_subtitle) = load_saved_selections(
+    let (saved_audio, saved_subtitle, saved_languages) = load_saved_selections(
         &state
             .ctx
             .db,
@@ -479,6 +500,7 @@ async fn items_playbackinfo_inner(
         requested_subtitle: q.subtitle_stream_index,
         remembered_audio: saved_audio,
         remembered_subtitle: saved_subtitle,
+        remembered_languages: &saved_languages,
     };
 
     let port = state
@@ -496,7 +518,7 @@ async fn items_playbackinfo_inner(
     let (probed, subtitle_media) = tokio::join!(
         async {
             service
-                .load(media)
+                .load(media, ranking, ranking_prefs)
                 .await?;
             service
                 .probe_candidates(ranking, ranking_prefs)
@@ -616,7 +638,7 @@ async fn items_playbackinfo_inner(
         // per-request API values (never persisted); resolving before the transcode
         // decision and subtitle delivery means those consumers see the stream the
         // client will actually get.
-        source.resolve_default_streams(
+        source.resolve_default_streams_remembering(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
@@ -624,6 +646,7 @@ async fn items_playbackinfo_inner(
             q.subtitle_stream_index,
             saved_audio,
             saved_subtitle,
+            &saved_languages,
         );
         let effective_sub_idx = q
             .subtitle_stream_index
@@ -887,7 +910,7 @@ async fn items_playbackinfo_inner(
     // matching can also pick addon subtitles (same request context as the
     // per-source resolve inside the probe loop).
     for source in &mut media_sources {
-        source.resolve_default_streams(
+        source.resolve_default_streams_remembering(
             &user_cfg,
             server_subtitle_lang,
             original_language.as_deref(),
@@ -895,6 +918,7 @@ async fn items_playbackinfo_inner(
             q.subtitle_stream_index,
             saved_audio,
             saved_subtitle,
+            &saved_languages,
         );
     }
 
@@ -910,6 +934,13 @@ async fn items_playbackinfo_inner(
     } else {
         0
     };
+    if let Some(source) = media_sources.get(selected_idx) {
+        StreamService::save_advertised_tracks(
+            &state.ctx,
+            &play_session_id,
+            &source.media_streams,
+        );
+    }
     if let Some(extras) = source_extras.get(selected_idx) {
         service.save_selected_stream(
             &play_session_id,
@@ -2003,6 +2034,14 @@ mod tests {
         authenticated_server, insert_test_source, insert_test_source_of_kind,
         insert_test_source_with_external_subtitle, new_test_server,
     };
+
+    async fn device_user(ctx: &crate::AppContext, token: &str) -> uuid::Uuid {
+        crate::db::auth::Device::get_by_access_token(&ctx.db, token)
+            .await
+            .unwrap()
+            .unwrap()
+            .user_id
+    }
 
     #[test]
     fn universal_direct_plays_only_what_the_client_lists() {
@@ -3275,6 +3314,319 @@ mod tests {
                 "SupportsDirectPlay": true,
             }]
         }));
+    }
+
+    /// A client that changes audio track mid-playback asks PlaybackInfo again
+    /// with the item id (the id auto-play handed out for source 0). That must
+    /// stay on the release being played, not rank the releases anew, or the
+    /// track index chosen for the old release lands on another language.
+    #[tokio::test]
+    async fn playbackinfo_during_playback_stays_on_the_playing_release() {
+        use crate::{
+            integration_test::{auth_header_with_token, seed_movie},
+            services::stream_service::{StreamService, StreamServiceConfig},
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let owner = seed_movie(ctx).await;
+        let now = chrono::Utc::now().naive_utc();
+        let mut releases = vec![];
+        for name in ["first", "second"] {
+            let template = insert_test_source(ctx).await;
+            let mut release = crate::db::Media {
+                title: name.to_string(),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(owner.id),
+                stream_info: template.stream_info,
+                probe_data: template.probe_data,
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            releases.push(release);
+        }
+        // Already refreshed, so no refresh drops the releases as stale.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        // The release playing is the one that does not rank first.
+        let playing = releases
+            .iter()
+            .map(|r| r.id)
+            .max()
+            .unwrap();
+        let device = crate::db::auth::Device::get_by_access_token(&ctx.db, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id: owner.id,
+            requested_id: None,
+            show_ungrouped: true,
+            stream_filter: None,
+            user_id: Some(device.user_id),
+        })
+        .save_selected_stream("running", &device.id, false, playing, playing);
+
+        let ask = async || {
+            let resp = server
+                .post(&format!(
+                    "/items/{}/playbackinfo?MediaSourceId={}&AudioStreamIndex=1",
+                    owner.id, owner.id
+                ))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({}))
+                .await;
+            resp.assert_status_ok();
+            let body: serde_json::Value = resp.json();
+            let ids = body["MediaSources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    s["Id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+            (
+                ids,
+                body["PlaySessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+
+        assert_eq!(
+            ask()
+                .await
+                .0[0],
+            owner
+                .id
+                .simple()
+                .to_string(),
+            "nothing is playing: auto-play lists the best release under the item id"
+        );
+
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": "running",
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        let playing_ids = vec![
+            playing
+                .simple()
+                .to_string(),
+        ];
+        let (ids, next_session) = ask().await;
+        assert_eq!(ids, playing_ids, "playback is running: stay on its release");
+
+        // The client starts the session the answer named; a second switch
+        // (by item id again, or without any id) must still stay on it.
+        server
+            .post("/sessions/playing")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": next_session,
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            ask()
+                .await
+                .0,
+            playing_ids,
+            "the restarted session keeps the release too"
+        );
+
+        server
+            .post("/sessions/playing/stopped")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "ItemId": owner.id.simple().to_string(),
+                "PlaySessionId": next_session,
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            ask()
+                .await
+                .0
+                .len(),
+            2,
+            "playback ended: a fresh play ranks anew"
+        );
+    }
+
+    /// Switching audio (and subtitles) while watching one title is remembered
+    /// as a language, and the next title starts with it — whatever release it
+    /// plays and wherever that language sits in its track list.
+    #[tokio::test]
+    async fn a_chosen_track_language_carries_over_to_the_next_title() {
+        use remux_sdks::remux::{MediaStream, MediaStreamType};
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        // One movie with a single release, audio tracks in the given order.
+        let mut movie_with = async |title: &str, imdb: &str, languages: [&str; 2]| {
+            let mut movie = crate::db::Media {
+                title: title.to_string(),
+                external_ids: crate::db::ExternalIds {
+                    imdb: crate::db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                    ..Default::default()
+                },
+                kind: crate::db::MediaKind::Movie,
+                runtime: Some(7200),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            movie
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(now - chrono::Duration::seconds(5))
+                .bind(movie.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            let template = insert_test_source(ctx).await;
+            let mut probe = template
+                .probe_data
+                .clone()
+                .unwrap();
+            probe
+                .media_streams
+                .truncate(1);
+            for (offset, language) in languages
+                .iter()
+                .enumerate()
+            {
+                probe
+                    .media_streams
+                    .push(MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(MediaStreamType::Audio),
+                        index: 1 + offset as i64,
+                        language: Some(language.to_string()),
+                        ..Default::default()
+                    });
+            }
+            let mut release = crate::db::Media {
+                title: format!("{title} release"),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(movie.id),
+                stream_info: template.stream_info,
+                probe_data: Some(probe),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+            movie
+        };
+        let first = movie_with("First", "tt0000001", ["eng", "fra"]).await;
+        // The same two languages, the other way round.
+        let second = movie_with("Second", "tt0000002", ["fra", "eng"]).await;
+
+        let playback_info = async |movie: &crate::db::Media| {
+            let resp = server
+                .post(&format!(
+                    "/items/{}/playbackinfo?UserId={}",
+                    movie.id, "ignored"
+                ))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({}))
+                .await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()
+        };
+
+        let info = playback_info(&first).await;
+        assert_eq!(
+            info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            json!(null),
+            "nothing remembered and no preference: no default"
+        );
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .unwrap();
+
+        let report = |path: &'static str, audio: i64| {
+            let body = json!({
+                "ItemId": first.id.simple().to_string(),
+                "PlaySessionId": psid,
+                "AudioStreamIndex": audio,
+                "SubtitleStreamIndex": -1,
+            });
+            let request = server
+                .post(path)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&body);
+            async move {
+                request
+                    .await
+                    .assert_status(StatusCode::NO_CONTENT)
+            }
+        };
+        report("/sessions/playing", 1).await;
+        // The client repeating the track it started on is not a choice.
+        report("/sessions/playing/progress", 1).await;
+        let remembered = async || {
+            crate::db::UserMediaState::remembered_languages(
+                &ctx.db,
+                &device_user(ctx, &token).await,
+                &second.id,
+            )
+            .await
+        };
+        assert_eq!(
+            remembered()
+                .await
+                .audio,
+            None
+        );
+
+        // Switching to French while watching is.
+        report("/sessions/playing/progress", 2).await;
+        assert_eq!(
+            remembered()
+                .await
+                .audio
+                .as_deref(),
+            Some("fr")
+        );
+
+        let info = playback_info(&second).await;
+        assert_eq!(
+            info["MediaSources"][0]["DefaultAudioStreamIndex"],
+            json!(1),
+            "French is the first track of the other title's release"
+        );
     }
 
     #[tokio::test]

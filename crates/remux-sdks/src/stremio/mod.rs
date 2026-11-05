@@ -133,9 +133,11 @@ fn deserialize_simple<'de, D>(d: D) -> Result<ResourceType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    // Only accept a string for the Simple variant:
+    // Only accept a string for the Simple variant. A name this server does not
+    // know is kept as `Other`, like the detailed form does: a manifest listing
+    // a resource of its own must still be readable.
     let s = String::deserialize(d)?;
-    ResourceType::from_str(&s).map_err(serde::de::Error::custom)
+    Ok(ResourceType::from_str(&s).unwrap_or(ResourceType::Other(s)))
 }
 
 impl Resource {
@@ -308,9 +310,25 @@ impl Endpoint for MetaEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaResponse {
     /// Absent (or null) when the addon does not know the id: Cinemeta answers
-    /// 200 `{}` for those.
-    #[serde(default)]
+    /// 200 `{}` for those, and others (AniSync) 200 `{"meta":{}}`.
+    #[serde(default, deserialize_with = "deserialize_meta")]
     pub meta: Option<Meta>,
+}
+
+/// A `meta` that is null or an empty object means "unknown id", not a
+/// malformed response.
+fn deserialize_meta<'de, D>(deserializer: D) -> Result<Option<Meta>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Object(map)) if map.is_empty() => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 /// `/subtitles/{type}/{id}/{extraArgs}.json`. The optional `filename` and
@@ -1124,6 +1142,22 @@ pub fn client(base: &str) -> Result<RestClient, url::ParseError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_ids_are_an_empty_meta_not_an_error() {
+        for body in [r#"{}"#, r#"{"meta":null}"#, r#"{"meta":{}}"#] {
+            let response: MetaResponse = serde_json::from_str(body).unwrap();
+            assert!(
+                response
+                    .meta
+                    .is_none(),
+                "{body}"
+            );
+        }
+        assert!(
+            serde_json::from_str::<MetaResponse>(r#"{"meta":{"id":"x"}}"#).is_err()
+        );
+    }
+
     use super::{
         Endpoint, MediaType, Meta, MetaResponse, ReleaseInfo, Stream,
         SubtitlesEndpoint, parse_duration_lossy,
@@ -1328,6 +1362,49 @@ mod tests {
                 start: 2016,
                 end: 2025
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    /// Manifests list resources this server has never heard of (AIOMetadata
+    /// advertises `watch_state` and `playback`). They must not make the whole
+    /// manifest unreadable.
+    #[test]
+    fn a_manifest_with_unknown_resources_still_parses() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "id": "aiometadata",
+            "name": "AIOMetadata",
+            "version": "1.0.0",
+            "resources": [
+                "catalog",
+                "meta",
+                "watch_state",
+                "playback",
+                {"name": "stream", "types": ["movie"]},
+                {"name": "something_new", "types": ["movie"]}
+            ],
+            "types": ["movie", "series"]
+        }))
+        .unwrap();
+        let kinds: Vec<_> = manifest
+            .resources
+            .iter()
+            .map(Resource::resource_type)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ResourceType::Catalog,
+                ResourceType::Meta,
+                ResourceType::Other("watch_state".into()),
+                ResourceType::Other("playback".into()),
+                ResourceType::Stream,
+                ResourceType::Other("something_new".into()),
+            ]
         );
     }
 }
