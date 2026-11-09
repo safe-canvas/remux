@@ -178,7 +178,7 @@ async fn load_saved_selections(
     let Some(media) = media else {
         return (None, None, Default::default());
     };
-    let languages =
+    let mut languages =
         crate::db::UserMediaState::remembered_languages(db, user_id, &media.id).await;
     match sqlx::query_as::<_, crate::db::UserMediaState>(
         "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
@@ -188,7 +188,11 @@ async fn load_saved_selections(
     .fetch_optional(db)
     .await
     {
-        Ok(Some(state)) => (state.audio_idx, state.subtitle_idx, languages),
+        Ok(Some(state)) => {
+            let (audio, subtitle, source) = state.remembered_indexes();
+            languages.indexes_source = source;
+            (audio, subtitle, languages)
+        }
         _ => (None, None, languages),
     }
 }
@@ -440,15 +444,22 @@ async fn items_playbackinfo_inner(
     // `sort_device_profile` (fresh-with-persisted-fallback) so this ranking
     // pass's own bitrate cap is consistent with the resolution/codec
     // judgments it's already making from that same profile.
-    let sort_max_bitrate: Option<i64> = match (
+    // MaxStaticBitrate joins in here only: it picks the version, while
+    // `max_bitrate` above stays what the client asked to transcode that
+    // version to.
+    let sort_max_bitrate: Option<i64> = [
         q.max_streaming_bitrate,
         sort_device_profile
             .as_ref()
             .and_then(|p| p.max_streaming_bitrate),
-    ) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
+        sort_device_profile
+            .as_ref()
+            .and_then(|p| p.max_static_bitrate)
+            .filter(|b| *b > 0),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     let ranking = (sort_mode != remux_sdks::remux::SortMediaSourcesMode::Disabled)
         .then(|| SourceRankingContext {
             mode: sort_mode,
@@ -2000,21 +2011,50 @@ pub struct UniversalAudioQuery {
     pub media_source_id: Option<Uuid>,
 }
 
+/// Smallest and largest body a bitrate test may ask for. Jellyfin's range;
+/// outside it the request is rejected rather than answered with a different
+/// size, because a client divides by the size it asked for.
+const BITRATE_TEST_DEFAULT_BYTES: u64 = 102_400;
+const BITRATE_TEST_MAX_BYTES: u64 = 100_000_000;
+const BITRATE_TEST_CHUNK_BYTES: u64 = 64 * 1024;
+
 /// Bitrate test endpoint - returns a body of the requested size for bandwidth measurement.
+///
+/// The body is random and streamed in chunks: random so compression on the
+/// way (a proxy) cannot shrink it and inflate the measured speed, streamed so
+/// the first byte leaves immediately instead of after building the whole body.
 #[get("/playback/bitratetest")]
 pub async fn playback_bitratetest_sized(
     Query(q): Query<BitrateTestQuery>,
 ) -> Result<impl IntoResponse> {
     let size = q
         .size
-        .unwrap_or(100_000)
-        .min(10_000_000) as usize;
-    let body = vec![0u8; size];
+        .unwrap_or(BITRATE_TEST_DEFAULT_BYTES);
+    (1..=BITRATE_TEST_MAX_BYTES)
+        .contains(&size)
+        .then_some(())
+        .context_bad_request(&format!(
+            "The requested size must be between 1 and {BITRATE_TEST_MAX_BYTES}"
+        ))?;
+    let body = futures_util::stream::unfold(size, |left| async move {
+        if left == 0 {
+            return None;
+        }
+        let len = left.min(BITRATE_TEST_CHUNK_BYTES) as usize;
+        let mut chunk = vec![0u8; len];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut chunk);
+        Some((
+            Ok::<_, io::Error>(bytes::Bytes::from(chunk)),
+            left - len as u64,
+        ))
+    });
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Length", size.to_string())
-        .body(Body::from(body))
+        .header("Content-Encoding", "identity")
+        .header("Cache-Control", "no-store")
+        .body(Body::from_stream(body))
         .unwrap())
 }
 
@@ -2034,6 +2074,179 @@ mod tests {
         authenticated_server, insert_test_source, insert_test_source_of_kind,
         insert_test_source_with_external_subtitle, new_test_server,
     };
+
+    #[tokio::test]
+    async fn bitrate_test_returns_exactly_the_requested_size() {
+        let (server, _guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        for size in [1usize, 65_536, 65_537, 300_000] {
+            let response = server
+                .get(&format!("/playback/bitratetest?size={size}"))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .await;
+            response.assert_status_ok();
+            assert_eq!(
+                response.header(http::header::CONTENT_LENGTH),
+                size.to_string()
+                    .as_str()
+            );
+            assert_eq!(
+                response
+                    .as_bytes()
+                    .len(),
+                size
+            );
+        }
+
+        let body = server
+            .get("/playback/bitratetest?size=200000")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .await
+            .into_bytes();
+        assert!(
+            body.iter()
+                .any(|b| *b != 0),
+            "a zero-filled body would compress away on the wire"
+        );
+
+        let default = server
+            .get("/playback/bitratetest")
+            .add_header(http::header::AUTHORIZATION, auth)
+            .await;
+        default.assert_status_ok();
+        assert_eq!(
+            default
+                .as_bytes()
+                .len(),
+            102_400
+        );
+    }
+
+    #[tokio::test]
+    async fn bitrate_test_rejects_sizes_it_will_not_serve() {
+        let (server, _guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        for size in ["0", "-1", "100000001", "1000000000", "abc"] {
+            let response = server
+                .get(&format!("/playback/bitratetest?size={size}"))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .expect_failure()
+                .await;
+            assert_eq!(
+                response.status_code(),
+                StatusCode::BAD_REQUEST,
+                "size={size}"
+            );
+        }
+    }
+
+    /// A device whose profile carries a `MaxStaticBitrate` gets the release below
+    /// it first, whether the profile comes with the request or was stored by
+    /// capabilities. A client that sends a different profile later replaces it.
+    #[tokio::test]
+    async fn a_device_bitrate_ceiling_picks_the_version_that_fits() {
+        use crate::integration_test::seed_movie;
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let owner = seed_movie(ctx).await;
+        let now = chrono::Utc::now().naive_utc();
+        for (name, bitrate) in [("heavy", 50_000_000), ("light", 5_000_000)] {
+            let template = insert_test_source(ctx).await;
+            let mut probe = template
+                .probe_data
+                .unwrap();
+            probe.bitrate = Some(bitrate);
+            let mut release = crate::db::Media {
+                title: name.to_string(),
+                kind: crate::db::MediaKind::Stream,
+                parent_id: Some(owner.id),
+                stream_info: template.stream_info,
+                probe_data: Some(probe),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            release
+                .save(&ctx.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(5))
+            .bind(owner.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let ranked = async |body: serde_json::Value| {
+            let resp = server
+                .post(&format!("/items/{}/playbackinfo", owner.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&body)
+                .await;
+            resp.assert_status_ok();
+            let body: serde_json::Value = resp.json();
+            body["MediaSources"][0]["Bitrate"]
+                .as_i64()
+                .unwrap()
+        };
+        let profile = |static_bitrate: Option<i64>| {
+            let mut profile = json!({
+                "Name": "Remux Client",
+                "DirectPlayProfiles": [
+                    { "Type": "Video", "Container": "*", "VideoCodec": "*", "AudioCodec": "*" }
+                ],
+                "TranscodingProfiles": [],
+                "CodecProfiles": []
+            });
+            if let Some(bitrate) = static_bitrate {
+                profile["MaxStaticBitrate"] = json!(bitrate);
+            }
+            profile
+        };
+
+        assert_eq!(
+            ranked(json!({})).await,
+            50_000_000,
+            "without a ceiling the heavier release leads"
+        );
+
+        // Reported through capabilities, then used by a request that sends no profile.
+        server
+            .post("/sessions/capabilities/full")
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .json(&json!({
+                "PlayableMediaTypes": ["Video"],
+                "DeviceProfile": profile(Some(8_000_000))
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(ranked(json!({})).await, 5_000_000);
+
+        // Sent with the request itself.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(Some(8_000_000)) })).await,
+            5_000_000
+        );
+
+        // Zero is no ceiling.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(Some(0)) })).await,
+            50_000_000
+        );
+
+        // A later profile without one replaces it: the client has to send it
+        // in both places.
+        assert_eq!(
+            ranked(json!({ "DeviceProfile": profile(None) })).await,
+            50_000_000
+        );
+        assert_eq!(ranked(json!({})).await, 50_000_000);
+    }
 
     async fn device_user(ctx: &crate::AppContext, token: &str) -> uuid::Uuid {
         crate::db::auth::Device::get_by_access_token(&ctx.db, token)
@@ -4969,7 +5182,21 @@ mod tests {
         let (server, guard, token) = authenticated_server().await;
         let auth = auth_header_with_token(&token);
         let media = insert_multilang_source(&guard.0).await;
-        let psid = "recall-audio-test";
+        // The index is saved with the release this play session's PlaybackInfo
+        // answer selected, as a client plays it.
+        let info: serde_json::Value = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await
+            .json();
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .expect("PlaySessionId")
+            .to_string();
 
         server
             .post("/sessions/playing")
@@ -5013,6 +5240,148 @@ mod tests {
             body["MediaSources"][0]["DefaultAudioStreamIndex"].as_i64(),
             Some(2),
             "Saved audio selection (index 2) should be recalled as DefaultAudioStreamIndex"
+        );
+    }
+
+    /// A remembered track index belongs to the release it was played on. Another
+    /// release of the same episode with a different track order gets its
+    /// original-language default instead of the language at that index.
+    #[tokio::test]
+    async fn remembered_audio_index_stays_with_its_release() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+        use uuid::Uuid;
+        let (server, guard, token) = authenticated_server().await;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let ctx = &guard.0;
+        let now = chrono::Utc::now().naive_utc();
+
+        let episode = crate::integration_test::seed_episode(ctx).await;
+        sqlx::query("UPDATE media SET original_language = 'en' WHERE id = ?")
+            .bind(episode.grandparent_id)
+            .execute(&ctx.db)
+            .await
+            .expect("set series original_language");
+        // Mark streams fresh so refresh_streams doesn't replace the fixtures.
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(now - chrono::Duration::seconds(30))
+            .bind(episode.id)
+            .execute(&ctx.db)
+            .await
+            .expect("set streams_refreshed_at");
+
+        let audio = |index: i64, language: &str| MediaStream {
+            codec: Some("aac".to_string()),
+            type_: Some(MediaStreamType::Audio),
+            index,
+            language: Some(language.to_string()),
+            ..Default::default()
+        };
+        let mut releases = Vec::new();
+        for (title, tracks) in [
+            ("compatible", [audio(1, "eng"), audio(2, "rus")]),
+            ("quality", [audio(1, "rus"), audio(2, "eng")]),
+        ] {
+            let mut source = db::Media {
+                title: title.to_string(),
+                kind: db::MediaKind::Stream,
+                parent_id: Some(episode.id),
+                stream_info: Some(crate::stream::StreamInfo {
+                    descriptor: crate::stream::StreamDescriptor::Local(
+                        format!("test-fixture-{title}.mp4").into(),
+                    ),
+                    ..Default::default()
+                }),
+                probe_data: Some(MediaSourceInfo {
+                    container: Some(VideoContainer::Mp4),
+                    media_streams: tracks.to_vec(),
+                    ..Default::default()
+                }),
+                created_at: now,
+                updated_at: now,
+                ..Default::default()
+            };
+            source
+                .save(&ctx.db)
+                .await
+                .expect("save source");
+            releases.push(source.id);
+        }
+        let (compatible, quality) = (releases[0], releases[1]);
+
+        let default_audio = |info: &serde_json::Value, release: Uuid| {
+            info["MediaSources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| {
+                    s["Id"]
+                        .as_str()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        == Some(release)
+                })
+                .unwrap_or_else(|| panic!("release {release} in {info}"))
+                ["DefaultAudioStreamIndex"]
+                .as_i64()
+        };
+        let playback_info = |release: Uuid| {
+            server
+                .post(&format!("/items/{}/playbackinfo", episode.id))
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({ "MediaSourceId": release.to_string() }))
+        };
+
+        // Play the compatible release on its English track, index 1.
+        let info: serde_json::Value = playback_info(compatible)
+            .await
+            .json();
+        assert_eq!(default_audio(&info, compatible), Some(1));
+        let psid = info["PlaySessionId"]
+            .as_str()
+            .expect("PlaySessionId")
+            .to_string();
+        for (path, position) in [
+            ("/sessions/playing", 0),
+            ("/sessions/playing/progress", 100_000_000i64),
+        ] {
+            server
+                .post(path)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .json(&json!({
+                    "ItemId": episode.id.to_string(),
+                    "MediaSourceId": compatible.to_string(),
+                    "PlaySessionId": psid,
+                    "PositionTicks": position,
+                    "AudioStreamIndex": 1
+                }))
+                .await
+                .assert_status_success();
+        }
+
+        let info: serde_json::Value = playback_info(quality)
+            .await
+            .json();
+        assert_eq!(
+            default_audio(&info, quality),
+            Some(2),
+            "index 1 is Russian in this release: English comes from the original language"
+        );
+        let details: serde_json::Value = server
+            .get(&format!("/items/{}", episode.id))
+            .add_header(http::header::AUTHORIZATION, auth.clone())
+            .add_query_params(&[("Fields", "MediaSources")])
+            .await
+            .json();
+        assert_eq!(default_audio(&details, quality), Some(2), "item details");
+        let info: serde_json::Value = playback_info(compatible)
+            .await
+            .json();
+        assert_eq!(
+            default_audio(&info, compatible),
+            Some(1),
+            "the release it was saved on still recalls it"
         );
     }
 

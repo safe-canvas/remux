@@ -774,6 +774,10 @@ pub struct ServerConfiguration {
     /// Maximum number of alternative streams to try before giving up (default: 3).
     #[default(Some(3_i64))]
     pub max_probe_fallback_streams: Option<i64>,
+    /// Group streams at all (default true). Off ignores every stream group
+    /// without touching their own enabled flags.
+    #[default(Some(true))]
+    pub stream_groups_enabled: Option<bool>,
     /// Show streams that don't match any group individually (default true).
     #[default(Some(true))]
     pub stream_groups_show_ungrouped: Option<bool>,
@@ -1581,6 +1585,7 @@ pub struct SpecialViewOptionDto {
 )]
 #[serde_as]
 #[derive(default2::Default, Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all(serialize = "PascalCase"))]
 #[skip_serializing_none]
 pub struct GetItemsQuery {
     pub user_id: Option<Uuid>,
@@ -1847,6 +1852,22 @@ impl GetItemsQuery {
                     .contains(&ItemFilter::IsFavorite)
                     .then_some(true)
             })
+    }
+
+    /// The like constraint, from `Filters=Likes` (liked) or `Filters=Dislikes`
+    /// (everything not liked, unrated items included, as in Jellyfin).
+    pub fn liked(&self) -> Option<bool> {
+        let filters = self
+            .filters
+            .as_deref()
+            .unwrap_or(&[]);
+        if filters.contains(&ItemFilter::Likes) {
+            Some(true)
+        } else if filters.contains(&ItemFilter::Dislikes) {
+            Some(false)
+        } else {
+            None
+        }
     }
 }
 
@@ -2187,6 +2208,7 @@ pub struct VideoStreamQuery {
     pub live_stream_id: Option<String>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TranscodingProfile {
@@ -2211,6 +2233,7 @@ pub struct TranscodingProfile {
     pub type_: Option<DlnaProfileType>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DeviceProfile {
@@ -2226,6 +2249,7 @@ pub struct DeviceProfile {
     pub subtitle_profiles: Vec<SubtitleProfile>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct DirectPlayProfile {
@@ -2248,6 +2272,7 @@ pub struct DirectPlayProfile {
     pub type_: Option<DlnaProfileType>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ContainerProfile {
@@ -2257,6 +2282,7 @@ pub struct ContainerProfile {
     pub conditions: Vec<ProfileCondition>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct CodecProfile {
@@ -2269,6 +2295,7 @@ pub struct CodecProfile {
     pub apply_conditions: Vec<ProfileCondition>,
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SubtitleProfile {
@@ -2373,6 +2400,7 @@ impl<'de> Deserialize<'de> for ProfileConditionProperty {
     }
 }
 
+#[skip_serializing_none]
 #[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct ProfileCondition {
@@ -2808,6 +2836,11 @@ impl RememberedSubtitle {
 pub struct RememberedLanguages {
     pub audio: Option<String>,
     pub subtitle: Option<RememberedSubtitle>,
+    /// The media source the remembered track *indexes* were saved on. An
+    /// index only means something in that file: another release of the same
+    /// title can carry a different language at the same position. `None`
+    /// puts no limit on the indexes.
+    pub indexes_source: Option<Uuid>,
 }
 
 /// Normalize a language tag (two-letter code, three-letter ISO 639-3 code, or
@@ -2963,7 +2996,9 @@ impl MediaSourceInfo {
     /// [`Self::resolve_default_streams`] that also knows the languages the user
     /// last chose. A remembered language beats a remembered index (an index
     /// only means something in the file it was saved for) and is looked for in
-    /// this source's own tracks; one this source lacks is skipped.
+    /// this source's own tracks; one this source lacks is skipped. Remembered
+    /// indexes saved on another source (see
+    /// [`RememberedLanguages::indexes_source`]) are ignored.
     pub fn resolve_default_streams_remembering(
         &mut self,
         user: &UserConfiguration,
@@ -2975,6 +3010,14 @@ impl MediaSourceInfo {
         remembered_subtitle: Option<i64>,
         languages: &RememberedLanguages,
     ) {
+        // An index saved on another release of this title would pick whatever
+        // that position holds here, often another language.
+        let indexes_apply = languages
+            .indexes_source
+            .is_none_or(|source| source == self.id);
+        let remembered_audio = remembered_audio.filter(|_| indexes_apply);
+        let remembered_subtitle = remembered_subtitle.filter(|_| indexes_apply);
+
         // -1 is Jellyfin's sentinel for "not set"; treat it the same as None.
         let client_wants_audio = requested_audio
             .map(|x| x >= 0)
@@ -3569,6 +3612,14 @@ pub enum ImageType {
     Thumb,
 }
 
+/// Jellyfin renders user ids without dashes.
+fn serialize_uuid_simple<S: serde::Serializer>(
+    id: &Uuid,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&id.simple())
+}
+
 #[skip_serializing_none]
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "PascalCase")]
@@ -3578,6 +3629,7 @@ pub struct UserDto {
     pub has_configured_easy_password: bool,
     pub has_configured_password: bool,
     pub has_password: bool,
+    #[serde(serialize_with = "serialize_uuid_simple")]
     pub id: Uuid,
     pub last_activity_date: Option<DateTime<Utc>>,
     pub last_login_date: Option<DateTime<Utc>>,
@@ -4175,6 +4227,10 @@ pub enum FilterRule {
     Favorite {
         value: bool,
     },
+    /// Matches items the requesting user has (or has not) put on their watchlist.
+    Watchlist {
+        value: bool,
+    },
     /// Matches items the requesting user has (or has not) played (play_count > 0).
     #[serde(alias = "watched")]
     Played {
@@ -4206,6 +4262,27 @@ pub enum FilterMatchMode {
 }
 
 impl CollectionFilter {
+    /// Whether the result depends on who asks: a rule on the requesting user's
+    /// own favourites, watchlist or play state. Such a collection has no one
+    /// list of items, so anything shared by all users (its generated poster)
+    /// must not be built from it.
+    pub fn is_per_user(&self) -> bool {
+        self.groups
+            .iter()
+            .flat_map(|g| {
+                g.rules
+                    .iter()
+            })
+            .any(|r| {
+                matches!(
+                    r,
+                    FilterRule::Favorite { .. }
+                        | FilterRule::Watchlist { .. }
+                        | FilterRule::Played { .. }
+                )
+            })
+    }
+
     /// Whether every item this filter returns is upcoming, which makes the
     /// server-wide "hide unreleased" setting pointless for it. An AND needs one
     /// operand that requires `Upcoming`; an OR needs all of its (non-empty)
@@ -8423,6 +8500,127 @@ impl Endpoint for RegenerateCollectionImage {
 mod tests {
     use super::*;
 
+    fn query_pairs(query: &GetItemsQuery) -> Vec<(String, String)> {
+        let encoded = serde_urlencoded::to_string(query).unwrap();
+        serde_urlencoded::from_str(&encoded).unwrap()
+    }
+
+    #[test]
+    fn items_query_is_written_with_pascal_case_names() {
+        let id = Uuid::new_v4();
+        let query = GetItemsQuery {
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Series]),
+            parent_id: Some(id),
+            user_id: Some(id),
+            start_index: Some(5),
+            search_term: Some("matrix".into()),
+            is_watchlist: Some(true),
+            person_ids: Some(vec!["a".into(), "b".into()]),
+            sort_by: Some(vec![ItemSortBy::SortName]),
+            sort_order: Some(vec![SortOrder::Descending]),
+            ..Default::default()
+        };
+        let pairs = query_pairs(&query);
+        let get = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+
+        assert_eq!(get("IncludeItemTypes"), Some("Movie,Series"));
+        assert_eq!(
+            get("ParentId"),
+            Some(
+                id.to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            get("UserId"),
+            Some(
+                id.to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(get("StartIndex"), Some("5"));
+        assert_eq!(get("SearchTerm"), Some("matrix"));
+        assert_eq!(get("IsWatchlist"), Some("true"));
+        assert_eq!(get("PersonIds"), Some("a,b"));
+        assert_eq!(get("SortBy"), Some("SortName"));
+        assert_eq!(get("SortOrder"), Some("Descending"));
+        assert!(
+            pairs
+                .iter()
+                .all(|(k, _)| k
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())),
+            "all keys must be PascalCase: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn items_query_still_reads_every_spelling() {
+        let id = Uuid::new_v4();
+        let expect = |q: GetItemsQuery| {
+            assert_eq!(
+                q.include_item_types,
+                Some(vec![MediaType::Movie, MediaType::Series])
+            );
+            assert_eq!(q.parent_id, Some(id));
+            assert_eq!(q.start_index, Some(5));
+            assert_eq!(
+                q.search_term
+                    .as_deref(),
+                Some("matrix")
+            );
+            assert_eq!(q.is_watchlist, Some(true));
+        };
+        for (types, parent, start, term, watch) in [
+            (
+                "include_item_types",
+                "parent_id",
+                "start_index",
+                "search_term",
+                "is_watchlist",
+            ),
+            (
+                "includeItemTypes",
+                "parentId",
+                "startIndex",
+                "searchTerm",
+                "isWatchlist",
+            ),
+            (
+                "IncludeItemTypes",
+                "ParentId",
+                "StartIndex",
+                "SearchTerm",
+                "IsWatchlist",
+            ),
+        ] {
+            let qs = format!(
+                "{types}=Movie,Series&{parent}={id}&{start}=5&{term}=matrix&{watch}=true"
+            );
+            expect(serde_urlencoded::from_str(&qs).unwrap());
+        }
+
+        // What the SDK writes must be understood by the server's own reader.
+        let written = GetItemsQuery {
+            include_item_types: Some(vec![MediaType::Movie, MediaType::Series]),
+            parent_id: Some(id),
+            start_index: Some(5),
+            search_term: Some("matrix".into()),
+            is_watchlist: Some(true),
+            ..Default::default()
+        };
+        expect(
+            serde_urlencoded::from_str(&serde_urlencoded::to_string(&written).unwrap())
+                .unwrap(),
+        );
+    }
+
     #[test]
     fn items_query_limit_defaults_only_when_omitted() {
         let omitted: GetItemsQuery = serde_json::from_str("{}").unwrap();
@@ -9011,6 +9209,7 @@ mod tests {
         RememberedLanguages {
             audio: audio.map(str::to_string),
             subtitle,
+            ..Default::default()
         }
     }
 
@@ -9118,6 +9317,52 @@ mod tests {
         );
         assert_eq!(src.default_audio_stream_index, None);
         assert_eq!(src.default_subtitle_stream_index, None);
+    }
+
+    /// A remembered index only counts on the source it was saved on. Another
+    /// release of the same title can hold a different language at the same
+    /// position, so it gets the original-language default instead.
+    #[test]
+    fn remembered_index_only_applies_to_its_own_source() {
+        let saved_on = source_with_subs(); // index 1 = English
+        let mut other = source_with_subs();
+        other.media_streams[0].language = Some("rus".to_string()); // index 1
+        other.media_streams[1].language = Some("eng".to_string()); // index 2
+        let mut cfg = user_cfg();
+        cfg.play_default_audio_track = true;
+        let remembered = RememberedLanguages {
+            indexes_source: Some(saved_on.id),
+            ..Default::default()
+        };
+        let resolve = |src: &mut MediaSourceInfo| {
+            src.resolve_default_streams_remembering(
+                &cfg,
+                None,
+                Some("en"),
+                None,
+                None,
+                Some(1),
+                Some(3),
+                &remembered,
+            )
+        };
+
+        let mut src = saved_on.clone();
+        resolve(&mut src);
+        assert_eq!(src.default_audio_stream_index, Some(1));
+        assert_eq!(src.default_subtitle_stream_index, Some(3));
+
+        let mut src = other.clone();
+        resolve(&mut src);
+        assert_eq!(
+            src.default_audio_stream_index,
+            Some(2),
+            "the original language decides, not index 1 (Russian here)"
+        );
+        assert_eq!(
+            src.default_subtitle_stream_index, None,
+            "the subtitle index belongs to the other release too"
+        );
     }
 
     /// Subtitles follow the remembered language, and "off" stays off even when
@@ -9397,6 +9642,33 @@ mod tests {
 
     fn id(n: u128) -> Uuid {
         Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn a_collection_filter_on_user_marks_depends_on_who_asks() {
+        let with = |rule| CollectionFilter {
+            groups: vec![FilterGroup {
+                rules: vec![rule],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(with(FilterRule::Watchlist { value: true }).is_per_user());
+        assert!(with(FilterRule::Favorite { value: true }).is_per_user());
+        assert!(with(FilterRule::Played { value: false }).is_per_user());
+        assert!(!with(FilterRule::HasTrailer { value: true }).is_per_user());
+        assert!(!CollectionFilter::default().is_per_user());
+    }
+
+    #[test]
+    fn watchlist_rule_round_trips_as_a_snake_case_field() {
+        let rule: FilterRule =
+            serde_json::from_str(r#"{"field":"watchlist","value":true}"#).unwrap();
+        assert_eq!(rule, FilterRule::Watchlist { value: true });
+        assert_eq!(
+            serde_json::to_value(&rule).unwrap(),
+            serde_json::json!({"field": "watchlist", "value": true})
+        );
     }
 
     #[test]

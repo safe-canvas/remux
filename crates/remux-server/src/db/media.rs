@@ -220,6 +220,13 @@ impl MediaKind {
         matches!(self, Self::TvChannel | Self::TvProgram)
     }
 
+    /// Whether a playback position means anything for the kind. Live TV has
+    /// none to come back to; Jellyfin stores 0 for it
+    /// (`SupportsPositionTicksResume`).
+    pub fn supports_position_resume(&self) -> bool {
+        !self.is_live_tv()
+    }
+
     /// Whether the kind is a directly-playable leaf item, as opposed to a
     /// container that only groups other media (albums, artists, series, ...).
     pub fn is_playable_leaf(&self) -> bool {
@@ -1421,6 +1428,9 @@ pub struct MediaFilter {
     pub total_count: bool,
     pub include_user_state: bool,
     pub include_child_count: bool,
+    /// `Fields=RecursiveItemCount`: report a series' or season's episode
+    /// count as `RecursiveItemCount`.
+    pub include_recursive_item_count: bool,
     pub include_relations: bool,
     /// `Some(false)` skips person relations for Jellyfin list queries without
     /// `Fields=People`; `None` preserves the historical internal-query behavior.
@@ -1621,6 +1631,10 @@ pub struct Media {
     pub series_count: Option<i64>,
     #[sqlx(skip)]
     pub unplayed_item_count: Option<i64>,
+    /// Share of a series' or season's episodes the user has played, 0-100.
+    /// Filled with the user state, like `unplayed_item_count`.
+    #[sqlx(skip)]
+    pub played_percentage: Option<f64>,
     #[sqlx(skip)]
     pub sources: Option<Vec<Media>>,
     /// When this source represents a stream group in a filtered result,
@@ -4587,6 +4601,11 @@ impl Media {
                     "ignored",
                     user_state_filter.ignored,
                 );
+                push_user_liked_filter(
+                    qb,
+                    user_state_filter.user_id,
+                    user_state_filter.liked,
+                );
 
                 // favorite — always uses EXISTS
                 if let Some(favorite) = &user_state_filter.favorite {
@@ -6105,66 +6124,50 @@ impl Media {
                     }
                 }
 
-                // Compute unplayed episode count for series/seasons
-                let grandparent_ids: Vec<Uuid> = records
+                // Episode counts for series (by grandparent) and seasons (by
+                // parent): total and unplayed by this user, released only.
+                let series_ids: Vec<Uuid> = records
                     .iter()
-                    .filter(|m| matches!(m.kind, MediaKind::Series | MediaKind::Season))
+                    .filter(|m| m.kind == MediaKind::Series)
                     .map(|m| m.id)
                     .collect();
-
-                if !grandparent_ids.is_empty() {
-                    // Count episodes per grandparent_id that have NOT been played by this user
-                    let unplayed_rows =
-                        fetch_all_chunked(db, &grandparent_ids, |chunk| {
-                            let mut qb = sqlx::QueryBuilder::new(
-                                "SELECT e.grandparent_id, COUNT(*) as cnt FROM media e \
-                         WHERE e.kind = 'episode' AND e.grandparent_id IN (",
-                            );
-                            let mut sep = qb.separated(", ");
-                            for id in chunk {
-                                sep.push_bind(id);
-                            }
-                            qb.push(
-                                ") AND NOT EXISTS (\
-                           SELECT 1 FROM user_media_state ums \
-                           WHERE ums.media_id = e.id \
-                           AND ums.user_id = ",
-                            );
-                            qb.push_bind(user_id);
-                            qb.push(" AND ums.play_count > 0)");
-                            if let Some(t) = filter.digital_released_before {
-                                push_release_date_filter(&mut qb, "e", t, true);
-                            }
-                            qb.push(" GROUP BY e.grandparent_id");
-                            qb
-                        })
-                        .await;
-
-                    match unplayed_rows {
-                        Ok(rows) => {
-                            let mut unplayed_map: HashMap<Uuid, i64> = HashMap::new();
-                            for row in rows {
-                                let sid: Uuid = row.get(0);
-                                let cnt: i64 = row.get(1);
-                                unplayed_map.insert(sid, cnt);
-                            }
-                            for media in &mut records {
-                                if matches!(
-                                    media.kind,
-                                    MediaKind::Series | MediaKind::Season
-                                ) {
-                                    media.unplayed_item_count = Some(
-                                        unplayed_map
-                                            .get(&media.id)
-                                            .copied()
-                                            .unwrap_or(0),
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("failed to load unplayed counts: {e}");
-                        }
+                let season_ids: Vec<Uuid> = records
+                    .iter()
+                    .filter(|m| m.kind == MediaKind::Season)
+                    .map(|m| m.id)
+                    .collect();
+                let mut counts: HashMap<Uuid, EpisodeCounts> = HashMap::new();
+                for (column, ids) in
+                    [("grandparent_id", &series_ids), ("parent_id", &season_ids)]
+                {
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    match episode_counts(
+                        db,
+                        column,
+                        ids,
+                        user_id,
+                        filter.digital_released_before,
+                    )
+                    .await
+                    {
+                        Ok(map) => counts.extend(map),
+                        Err(e) => warn!("failed to load unplayed counts: {e}"),
+                    }
+                }
+                for media in &mut records {
+                    if !matches!(media.kind, MediaKind::Series | MediaKind::Season) {
+                        continue;
+                    }
+                    let c = counts
+                        .get(&media.id)
+                        .copied()
+                        .unwrap_or_default();
+                    media.unplayed_item_count = Some(c.unplayed);
+                    media.played_percentage = c.played_percentage();
+                    if filter.include_recursive_item_count {
+                        media.recursive_item_count = Some(c.total);
                     }
                 }
             }
@@ -6691,10 +6694,12 @@ impl Media {
         let favorite = filter.favorite();
         let watchlist = filter.watchlist();
         let ignored = filter.ignored();
+        let liked = filter.liked();
 
         let user_state = if favorite.is_some()
             || watchlist.is_some()
             || ignored.is_some()
+            || liked.is_some()
             || is_played
             || is_unplayed
             || is_resumable
@@ -6712,6 +6717,7 @@ impl Media {
                     None
                 },
                 resumable: if is_resumable { Some(true) } else { None },
+                liked,
                 ..Default::default()
             })
         } else {
@@ -6794,6 +6800,10 @@ impl Media {
                         .as_deref()
                         .map(|f| f.contains(&api::ItemFields::ChildCount))
                         .unwrap_or(false),
+                include_recursive_item_count: filter
+                    .fields
+                    .as_deref()
+                    .is_some_and(|f| f.contains(&api::ItemFields::RecursiveItemCount)),
                 include_relations: api::fields_include_relations(
                     filter
                         .fields
@@ -8777,6 +8787,71 @@ fn push_genre_count_scope<'a>(
     }
 }
 
+/// Episodes under a series or season: all released ones and those the user
+/// has not played.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct EpisodeCounts {
+    total: i64,
+    unplayed: i64,
+}
+
+impl EpisodeCounts {
+    /// Jellyfin's folder `PlayedPercentage` (`Folder.FillUserDataDtoValues`
+    /// in 12.x): played / total * 100, set whenever there is at least one
+    /// episode (0 and 100 included).
+    fn played_percentage(self) -> Option<f64> {
+        (self.total > 0)
+            .then(|| (self.total - self.unplayed) as f64 / self.total as f64 * 100.0)
+    }
+}
+
+/// [`EpisodeCounts`] keyed by `column` (`grandparent_id` for series,
+/// `parent_id` for seasons).
+async fn episode_counts(
+    db: &SqlitePool,
+    column: &'static str,
+    ids: &[Uuid],
+    user_id: Uuid,
+    released_before: Option<NaiveDateTime>,
+) -> std::result::Result<HashMap<Uuid, EpisodeCounts>, sqlx::Error> {
+    let rows = fetch_all_chunked(db, ids, |chunk| {
+        let mut qb = sqlx::QueryBuilder::new("SELECT e.");
+        qb.push(column)
+            .push(
+                ", COUNT(*), SUM(NOT EXISTS (SELECT 1 FROM user_media_state ums \
+                 WHERE ums.media_id = e.id AND ums.user_id = ",
+            )
+            .push_bind(user_id)
+            .push(" AND ums.play_count > 0)) FROM media e WHERE e.kind = 'episode' AND e.")
+            .push(column)
+            .push(" IN (");
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(id);
+        }
+        qb.push(")");
+        if let Some(t) = released_before {
+            push_release_date_filter(&mut qb, "e", t, true);
+        }
+        qb.push(" GROUP BY e.")
+            .push(column);
+        qb
+    })
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get(0),
+                EpisodeCounts {
+                    total: row.get(1),
+                    unplayed: row.get(2),
+                },
+            )
+        })
+        .collect())
+}
+
 /// Runs the query `build` makes for each `SQLITE_VAR_LIMIT`-sized chunk of
 /// `ids` and concatenates the rows, so a per-record lookup over a large
 /// unpaged result doesn't go past SQLite's bound-variable limit. Only for
@@ -8869,6 +8944,32 @@ fn push_user_flag_filter<'a>(
     qb.push("SELECT ums.media_id FROM user_media_state ums WHERE ums.")
         .push(column)
         .push(" = 1");
+    if let Some(user_id) = user_id {
+        qb.push(" AND ums.user_id = ")
+            .push_bind(user_id);
+    }
+    qb.push(")");
+}
+
+/// Jellyfin's `IsLiked` filter (`Filters=Likes` / `Filters=Dislikes`): a like
+/// is a rating at or above `UserRating::LIKE_THRESHOLD`. Dislikes is the
+/// complement of the liked set, so unrated items count as not liked, exactly
+/// as Jellyfin's `!likedIds.Contains(e.Id)`.
+fn push_user_liked_filter<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>,
+    user_id: Option<Uuid>,
+    want: Option<bool>,
+) {
+    let Some(want) = want else {
+        return;
+    };
+    qb.push(if want {
+        " AND media.id IN ("
+    } else {
+        " AND media.id NOT IN ("
+    });
+    qb.push("SELECT ums.media_id FROM user_media_state ums WHERE ums.rating >= ")
+        .push_bind(super::UserRating::LIKE_THRESHOLD);
     if let Some(user_id) = user_id {
         qb.push(" AND ums.user_id = ")
             .push_bind(user_id);
@@ -9546,6 +9647,26 @@ fn filter_rule_to_sql(
             };
             Some((sql, false))
         }
+        R::Watchlist { value } => {
+            // A watchlist is one user's. With no requesting user there is no
+            // list to read, rather than the union of everyone's.
+            let Some(user_id) = user_id else {
+                return Some((if *value { "0" } else { "1" }.to_string(), false));
+            };
+            // List the user's few watchlisted ids (`idx_ums_user_watchlist`)
+            // rather than probing their state once per media row.
+            let listed = format!(
+                "SELECT ums.media_id FROM user_media_state ums \
+                 WHERE ums.user_id = X'{}' AND ums.watchlist = 1",
+                user_id.simple()
+            );
+            let sql = if *value {
+                format!("media.id IN ({listed})")
+            } else {
+                format!("media.id NOT IN ({listed})")
+            };
+            Some((sql, false))
+        }
         R::Played { value } => {
             // CROSS JOIN: start the rollup from the user's play state, see
             // push_played_filter.
@@ -9713,6 +9834,17 @@ pub(crate) fn build_genre_relations_from_names(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn episode_counts_played_percentage_matches_jellyfin_folders() {
+        let pct = |total, unplayed| {
+            super::EpisodeCounts { total, unplayed }.played_percentage()
+        };
+        assert_eq!(pct(0, 0), None);
+        assert_eq!(pct(4, 4), Some(0.0));
+        assert_eq!(pct(4, 3), Some(25.0));
+        assert_eq!(pct(4, 0), Some(100.0));
+    }
+
     use super::*;
 
     fn tmdb_ratings(score: f64, vote_count: Option<u32>) -> ExternalRatings {
@@ -12735,6 +12867,192 @@ mod tests {
         assert!(
             titles.is_empty(),
             "another user's favorite must not bleed through"
+        );
+    }
+
+    // ── Watchlist filter rule tests ───────────────────────────────────
+
+    async fn put_on_watchlist(
+        db: &sqlx::SqlitePool,
+        user_id: uuid::Uuid,
+        media_id: uuid::Uuid,
+    ) {
+        sqlx::query(
+            "INSERT INTO user_media_state \
+             (user_id, media_id, watchlist, watchlisted_at, playback_position) \
+             VALUES (?1, ?2, 1, ?3, 0)",
+        )
+        .bind(user_id)
+        .bind(media_id)
+        .bind(chrono::Utc::now().naive_utc())
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn watchlist_filter_rule_lists_only_the_requesting_users_items() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let (uid, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+
+        let mut mine = media_row(MediaKind::Movie, "Mine", "tt8882001");
+        mine.save(db)
+            .await
+            .unwrap();
+        let mut theirs = media_row(MediaKind::Movie, "Theirs", "tt8882002");
+        theirs
+            .save(db)
+            .await
+            .unwrap();
+        let mut neither = media_row(MediaKind::Movie, "Neither", "tt8882003");
+        neither
+            .save(db)
+            .await
+            .unwrap();
+        put_on_watchlist(db, uid, mine.id).await;
+        put_on_watchlist(db, other, theirs.id).await;
+
+        let on = filter_rule_titles(
+            db,
+            remux_sdks::remux::FilterRule::Watchlist { value: true },
+            uid,
+        )
+        .await;
+        assert_eq!(on, vec!["Mine"], "another user's watchlist must not show");
+
+        let mut off = filter_rule_titles(
+            db,
+            remux_sdks::remux::FilterRule::Watchlist { value: false },
+            uid,
+        )
+        .await;
+        off.sort();
+        assert_eq!(
+            off,
+            vec!["Neither", "Theirs"],
+            "items without a row count as not on the watchlist"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchlist_filter_rule_without_a_user_matches_no_ones_list() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let mut item = media_row(MediaKind::Movie, "Listed", "tt8884001");
+        item.save(db)
+            .await
+            .unwrap();
+        put_on_watchlist(db, uuid::Uuid::new_v4(), item.id).await;
+
+        let titles = |value| {
+            let filter = remux_sdks::remux::CollectionFilter {
+                groups: vec![remux_sdks::remux::FilterGroup {
+                    rules: vec![remux_sdks::remux::FilterRule::Watchlist { value }],
+                    match_mode: remux_sdks::remux::FilterMatchMode::All,
+                }],
+                match_mode: remux_sdks::remux::FilterMatchMode::All,
+            };
+            async move {
+                Media::get_by_filter(
+                    db,
+                    &MediaFilter {
+                        kind: Some(vec![MediaKind::Movie]),
+                        filter_rules: Some(filter),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .records
+                .into_iter()
+                .map(|m| m.title)
+                .collect::<Vec<_>>()
+            }
+        };
+        assert!(
+            titles(true)
+                .await
+                .is_empty(),
+            "another user's watchlist must not stand in for no user"
+        );
+        assert_eq!(titles(false).await, vec!["Listed"]);
+    }
+
+    /// The migration seeds one smart collection of the requesting user's own
+    /// watchlist, listing movies and series.
+    #[tokio::test]
+    async fn the_seeded_watchlist_collection_lists_each_users_own_watchlist() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let id = uuid::Uuid::parse_str("a1b2c3d4-0000-4000-8000-000000000004").unwrap();
+        let collection = Media::get_by_id(db, &id)
+            .await
+            .unwrap()
+            .expect("seeded watchlist collection");
+        assert_eq!(collection.title, "Watchlist");
+        assert_eq!(collection.kind, MediaKind::Collection);
+        assert_eq!(collection.collection_kind, Some(CollectionKind::Smart));
+        assert_eq!(
+            collection.collection_media_kind,
+            Some(CollectionMediaKind::Mixed)
+        );
+        assert!(collection.promoted, "a library view of its own");
+
+        let (uid, other) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let mut film = media_row(MediaKind::Movie, "Film", "tt8883001");
+        film.save(db)
+            .await
+            .unwrap();
+        let mut show = media_row(MediaKind::Series, "Show", "tt8883002");
+        show.save(db)
+            .await
+            .unwrap();
+        put_on_watchlist(db, uid, film.id).await;
+        put_on_watchlist(db, uid, show.id).await;
+        put_on_watchlist(db, other, film.id).await;
+
+        let members = |user_id| {
+            let filter = MediaFilter {
+                kind: collection
+                    .collection_media_kind
+                    .as_ref()
+                    .map(CollectionMediaKind::media_kinds),
+                filter_rules: collection
+                    .parse_smart_filter()
+                    .cloned(),
+                user_id: Some(user_id),
+                sort_by: vec![api::ItemSortBy::SortName],
+                ..Default::default()
+            };
+            async move {
+                Media::get_by_filter(db, &filter)
+                    .await
+                    .unwrap()
+                    .records
+                    .into_iter()
+                    .map(|m| m.title)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(members(uid).await, vec!["Film", "Show"]);
+        assert_eq!(members(other).await, vec!["Film"]);
+        assert!(
+            members(uuid::Uuid::new_v4())
+                .await
+                .is_empty()
         );
     }
 

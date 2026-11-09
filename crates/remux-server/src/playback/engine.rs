@@ -207,6 +207,9 @@ pub(crate) fn select_hw_accel(
 const MAX_BUFFER_SECS: u32 = 300;
 /// Seconds behind the playback position before a segment is eligible for deletion.
 const SEGMENT_KEEP_SECS: u32 = 30;
+/// How far back a live stream can be rewound or paused: the length of its
+/// sliding HLS playlist.
+const LIVE_REWIND_SECS: u32 = 30 * 60;
 
 fn ffmpeg_bin() -> String {
     std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".into())
@@ -223,6 +226,13 @@ fn send_signal(_pid: u32, _sig: i32) {}
 /// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
 /// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
 ///
+/// A live stream is never paused: the source keeps sending, so a stopped
+/// ffmpeg falls behind or loses the connection, and a client that sends no
+/// progress reports would read as "nothing played" and stall after
+/// MAX_BUFFER_SECS. Jellyfin throttles only recorded files. Its segments are
+/// kept for LIVE_REWIND_SECS (ffmpeg's sliding playlist deletes them), so a
+/// viewer can pause and rewind.
+///
 /// `start_index` is this run's `-start_number` (see `segment_start_index`):
 /// segment file names are numbered from the seek position, not from 0, so
 /// it must be subtracted from whatever index ffmpeg has reached before
@@ -237,6 +247,7 @@ fn spawn_buffer_monitor(
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     play_session_id: String,
+    is_live: bool,
 ) {
     tokio::spawn(async move {
         let mut paused = false;
@@ -260,7 +271,7 @@ fn spawn_buffer_monitor(
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
 
-            if pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
+            if !is_live && pid != 0 && !paused && ahead >= MAX_BUFFER_SECS {
                 debug!(play_session_id, pid, ahead, "Buffer full — pausing ffmpeg");
                 #[cfg(unix)]
                 send_signal(pid, libc::SIGSTOP);
@@ -278,11 +289,13 @@ fn spawn_buffer_monitor(
                 paused = false;
             }
 
-            // Every 30 seconds, delete segments that are more than SEGMENT_KEEP_SECS
-            // behind the current playback position.
-            if ticks % 30 == 0 && playback_secs > SEGMENT_KEEP_SECS {
-                let cutoff_idx = (playback_secs - SEGMENT_KEEP_SECS) / segment_length;
-                delete_old_segments(&output_dir, cutoff_idx);
+            // Every 30 seconds, delete segments that are no longer needed.
+            if ticks % 30 == 0 {
+                if let Some(cutoff_idx) =
+                    cleanup_cutoff(is_live, playback_secs, segment_length)
+                {
+                    delete_old_segments(&output_dir, cutoff_idx);
+                }
             }
         }
 
@@ -295,6 +308,22 @@ fn spawn_buffer_monitor(
             }
         }
     });
+}
+
+/// The segment index below which segments can be deleted, if any: a few
+/// seconds behind the playback position of a recorded stream. A live stream
+/// has none, as its sliding playlist (see `LIVE_REWIND_SECS`) already deletes
+/// what it no longer lists, and clients may report no position at all.
+fn cleanup_cutoff(
+    is_live: bool,
+    playback_secs: u32,
+    segment_length: u32,
+) -> Option<u32> {
+    if is_live || playback_secs <= SEGMENT_KEEP_SECS {
+        return None;
+    }
+    let cutoff = (playback_secs - SEGMENT_KEEP_SECS) / segment_length.max(1);
+    (cutoff > 0).then_some(cutoff)
 }
 
 /// Parses the numeric index out of a segment filename — `segment_00042.ts`,
@@ -1082,7 +1111,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if let Some(audio_idx) = params.audio_stream_index {
+        }
+        if let Some(audio_idx) = params.audio_stream_index {
             args.extend([
                 "-map".into(),
                 "0:v:0".into(),
@@ -1250,15 +1280,30 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
             .into_owned(),
     ]);
 
-    // Keep all segments for the playback session. This is also Jellyfin's
-    // live-TV HLS behavior: EVENT playlists grow for the duration of a live
-    // session and let clients start from its beginning.
-    args.extend([
-        "-hls_playlist_type".into(),
-        "event".into(),
-        "-hls_list_size".into(),
-        "0".into(),
-    ]);
+    if params.is_live {
+        // A sliding window of LIVE_REWIND_SECS: the playlist only lists the
+        // segments still kept, and ffmpeg deletes the ones that fall out of
+        // it, so a client never asks for a segment that is gone.
+        args.extend([
+            "-hls_list_size".into(),
+            (LIVE_REWIND_SECS
+                / params
+                    .segment_length
+                    .max(1))
+            .to_string(),
+            "-hls_flags".into(),
+            "delete_segments".into(),
+        ]);
+    } else {
+        // Keep all segments for the playback session: EVENT playlists grow
+        // for the duration of it and let clients start from its beginning.
+        args.extend([
+            "-hls_playlist_type".into(),
+            "event".into(),
+            "-hls_list_size".into(),
+            "0".into(),
+        ]);
+    }
 
     if is_hevc_copy {
         // Apple HLS spec: HEVC must be delivered in fMP4/CMAF segments, not MPEG-TS.
@@ -1426,6 +1471,7 @@ pub async fn start_transcode(
                     ffmpeg_pid.clone(),
                     monitor_stop_rx,
                     s.id.clone(),
+                    params.is_live,
                 );
                 s.output_dir
                     .clone()
@@ -1903,24 +1949,16 @@ pub(crate) fn build_progressive_args(
         };
         if let Some(ref filter) = vf {
             args.extend(["-vf".into(), filter.clone()]);
-        } else if params
-            .audio_stream_index
-            .is_some()
-            || params
-                .subtitle_stream_index
-                .is_some()
-        {
-            args.extend(["-map".into(), "0:v:0".into()]);
-            if let Some(audio_idx) = params.audio_stream_index {
-                args.extend(["-map".into(), format!("0:{}", audio_idx)]);
-            } else {
-                args.extend(["-map".into(), "0:a?".into()]);
-            }
-            if let Some(sub_idx) = params.subtitle_stream_index {
-                if sub_idx >= 0 {
-                    args.extend(["-map".into(), format!("0:{}?", sub_idx)]);
-                }
-            }
+        }
+        // Text subtitles are delivered separately; mapping one into the mp4
+        // output makes ffmpeg fail ("no encoder for codec none").
+        if let Some(audio_idx) = params.audio_stream_index {
+            args.extend([
+                "-map".into(),
+                "0:v:0".into(),
+                "-map".into(),
+                format!("0:{}", audio_idx),
+            ]);
         }
     }
 
@@ -2436,11 +2474,54 @@ mod tests {
             .map(|w| w[1].as_str())
     }
 
+    fn mapped_streams(args: &[String]) -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
     fn no_devices(_: &str) -> bool {
         false
     }
     fn all_devices(_: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn a_recorded_stream_keeps_a_little_behind_the_playback_position() {
+        // 6 s segments: 130 s played, 30 s kept, so segments below 16 go.
+        assert_eq!(super::cleanup_cutoff(false, 130, 6), Some(16));
+        assert_eq!(super::cleanup_cutoff(false, 30, 6), None);
+        assert_eq!(super::cleanup_cutoff(false, 0, 6), None);
+    }
+
+    #[test]
+    fn a_live_stream_is_not_cleaned_up_by_position() {
+        // Its sliding playlist deletes segments; a client with no progress
+        // reports must not matter either way.
+        assert_eq!(super::cleanup_cutoff(true, 0, 6), None);
+        assert_eq!(super::cleanup_cutoff(true, 3600, 6), None);
+    }
+
+    #[test]
+    fn live_hls_is_a_thirty_minute_sliding_window_and_vod_an_event_playlist() {
+        let args_for = |is_live| {
+            super::build_hls_args(&super::TranscodeParams {
+                is_live,
+                segment_length: 6,
+                ..Default::default()
+            })
+        };
+        let live = args_for(true);
+        assert_eq!(arg_after(&live, "-hls_list_size"), Some("300"));
+        assert_eq!(arg_after(&live, "-hls_flags"), Some("delete_segments"));
+        assert_eq!(arg_after(&live, "-hls_playlist_type"), None);
+
+        let vod = args_for(false);
+        assert_eq!(arg_after(&vod, "-hls_list_size"), Some("0"));
+        assert_eq!(arg_after(&vod, "-hls_playlist_type"), Some("event"));
+        assert_eq!(arg_after(&vod, "-hls_flags"), None);
     }
 
     #[test]
@@ -3357,6 +3438,19 @@ mod tests {
         let vf = arg_after(&args, "-vf").expect("-vf missing");
         assert!(vf.contains("min(1280,iw)"), "vf: {vf}");
         assert!(vf.contains(":-2"), "vf: {vf}");
+    }
+
+    #[test]
+    fn hls_video_filter_keeps_selected_audio_track() {
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            ..default_hls(PathBuf::from("/tmp/test_vf_audio"))
+        });
+
+        assert!(args_contains(&args, "-vf"));
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
     }
 
     #[test]
@@ -4714,6 +4808,32 @@ mod tests {
 
         assert_eq!(arg_after(&args, "-c:v"), Some("copy"));
         assert!(!args_contains(&args, "-filter_complex"));
+    }
+
+    #[test]
+    fn progressive_video_filter_keeps_selected_audio_track() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            ..default_progressive()
+        });
+
+        assert!(args_contains(&args, "-vf"));
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
+    }
+
+    #[test]
+    fn progressive_text_subtitle_is_not_mapped_into_output() {
+        let args = build_progressive_args(&ProgressiveTranscodeParams {
+            video_codec: "libx264".into(),
+            max_width: Some(1280),
+            audio_stream_index: Some(1),
+            subtitle_stream_index: Some(2),
+            ..default_progressive()
+        });
+
+        assert_eq!(mapped_streams(&args), ["0:v:0", "0:1"]);
     }
 
     #[test]
