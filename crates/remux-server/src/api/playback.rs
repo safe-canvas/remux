@@ -1,3 +1,4 @@
+use crate::ids::UserId;
 use anyhow::anyhow;
 use axum::Json;
 
@@ -13,36 +14,26 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::extract::Query;
-use chrono::Utc;
-use futures_util::{StreamExt, TryStreamExt};
 use headers;
 use http::{Response, StatusCode};
-use remux_macros::{delete, get, post, query};
-use remux_sdks::remux::{PlayMethod, VideoContainer};
-use remux_utils::Store;
-use serde::Deserialize;
-use serde_json::json;
-use serde_with::{DurationSeconds, serde_as};
-use std::{io, time::Duration};
-use tokio_util::io::ReaderStream;
+use remux_macros::{get, post, query};
+use remux_sdks::remux::VideoContainer;
+use std::io;
 use tracing::{debug, error, info, trace, warn};
-use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AppState, api,
-    api::MediaSourceInfoExt,
-    common,
+    AppState, api, common,
     common::{TickUnit, ToRunTimeTicks},
     db,
     db::auth,
-    playback::hw_accel,
+    playback::{codec::CodecTarget, hw_accel},
     playback_session::{FfmpegTrack, ServedPlayback},
 };
 
 use crate::{
-    IntoApiError, OptionExt, ResultExt,
-    device_profile::{DeviceProfileExt, SourceRankingContext, SubtitleCodec},
+    IntoApiError, OptionExt,
+    device_profile::SourceRankingContext,
     errors::LogErr,
     playback::{
         decision::{
@@ -51,11 +42,8 @@ use crate::{
             selected_audio_stream,
         },
         engine::ProgressiveFormat,
-        session::{TranscodeSession, TranscodeState},
     },
-    sdks,
     services::{MediaResolveService, ProbeResult, StreamService, StreamServiceConfig},
-    torrent,
 };
 use axum_anyhow::ApiResult as Result;
 
@@ -228,11 +216,11 @@ async fn items_playbackinfo_inner(
 ) -> Result<impl IntoResponse> {
     let (id, media_source_id) = StreamService::version_target(
         &state.ctx,
-        Some(
+        Some(UserId(
             session
                 .user
                 .id,
-        ),
+        )),
         id,
         q.media_source_id,
     )
@@ -1090,7 +1078,7 @@ async fn items_playbackinfo_inner(
         }
     }
 
-    let error_code = if media_sources.is_empty() {
+    let _error_code = if media_sources.is_empty() {
         media_sources.push(api::MediaSourceInfo {
             id,
             e_tag: id,
@@ -1334,36 +1322,6 @@ pub async fn videos_stream_by_container(
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
-fn ext_from_descriptor(descriptor: &crate::stream::StreamDescriptor) -> String {
-    match descriptor {
-        crate::stream::StreamDescriptor::Local(path) => path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mkv")
-            .to_string(),
-        crate::stream::StreamDescriptor::Http { url, .. }
-        | crate::stream::StreamDescriptor::Rtsp { url } => url
-            .split('?')
-            .next()
-            .unwrap_or(url.as_str())
-            .rsplit('.')
-            .next()
-            .filter(|e| !e.is_empty() && e.len() <= 5)
-            .unwrap_or("mkv")
-            .to_string(),
-        crate::stream::StreamDescriptor::Torrent { file_hint, .. } => file_hint
-            .as_deref()
-            .and_then(|h| {
-                std::path::Path::new(h)
-                    .extension()
-                    .and_then(|e| e.to_str())
-            })
-            .unwrap_or("mkv")
-            .to_string(),
-        _ => "mkv".to_string(),
-    }
-}
-
 /// A Matroska source can be served unchanged when the requested output is
 /// Matroska. `stream.mkv` callers commonly omit `AudioCodec`; unlike the
 /// progressive endpoint's FFmpeg default, that does not itself request an
@@ -1421,8 +1379,13 @@ async fn videos_stream_inner(
     // one whose media info the client was given.
     // A version held as the item id maps back to its owner first, so the saved
     // selection is looked up under the same key PlaybackInfo stored it with.
-    let (id, media_source_id) =
-        StreamService::version_target(&state.ctx, user_id, id, q.media_source_id).await;
+    let (id, media_source_id) = StreamService::version_target(
+        &state.ctx,
+        user_id.map(UserId),
+        id,
+        q.media_source_id,
+    )
+    .await;
     let selected = StreamService::selected_stream_id(
         &state.ctx,
         device_id.as_deref(),
@@ -1662,7 +1625,7 @@ async fn videos_stream_inner(
     let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     // Keep a copy before the video_codec is moved into params (needed for Content-Type logic)
-    let is_copy_video = video_codec == "copy";
+    let is_copy_video = video_codec.is_copy();
 
     info!(
         "starting progressive transcode for: {:?} (container={}, vcodec={}, acodec={}, start_ticks={:?}, bitrate={:?}, video_transcoding={})",
@@ -1695,17 +1658,15 @@ async fn videos_stream_inner(
     });
     // Copying audio the output container can't carry makes ffmpeg fail
     // mid-stream. Encode it instead, or refuse if audio transcoding is off.
-    let format = ProgressiveFormat::for_request(&container, &video_codec);
-    let audio_codec = if audio_codec == "copy"
+    let format = ProgressiveFormat::for_request(&container, video_codec.is_copy());
+    let audio_codec = if audio_codec.is_copy()
         && !format.can_copy_audio(source_audio_codec.as_deref())
     {
         if !permissions.audio_transcoding {
             return Err(anyhow!("Forbidden")
                 .context_forbidden("Progressive playback requires audio transcoding"));
         }
-        format
-            .fallback_audio_codec()
-            .to_string()
+        CodecTarget::from(format.fallback_audio_codec())
     } else {
         audio_codec
     };
@@ -1767,15 +1728,15 @@ async fn videos_stream_inner(
     }
 
     record_served(ServedPlayback::Ffmpeg {
-        video: FfmpegTrack::new(&video_codec, source_video_codec.as_deref()),
-        audio: FfmpegTrack::new(&audio_codec, source_audio_codec.as_deref()),
+        video: FfmpegTrack::new(&video_codec.clone(), source_video_codec.as_deref()),
+        audio: FfmpegTrack::new(&audio_codec.clone(), source_audio_codec.as_deref()),
     });
 
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url: url,
         container: container.clone(),
-        video_codec,
-        audio_codec,
+        video_codec: video_codec.clone(),
+        audio_codec: audio_codec.clone(),
         start_time_ticks: q.start_time_ticks,
         max_width: q
             .max_width
@@ -1838,9 +1799,6 @@ async fn videos_stream_inner(
         h264_crf: encoding_opts
             .h264_crf
             .unwrap_or(23),
-        h265_crf: encoding_opts
-            .h265_crf
-            .unwrap_or(28),
         normalize_audio_loudness: encoding_opts
             .normalize_audio_loudness
             .unwrap_or(false),
@@ -1874,9 +1832,9 @@ async fn videos_stream_inner(
 /// Returns additional parts for a multi-file video item.
 #[get("/videos/{id}/additionalparts")]
 pub async fn video_additional_parts(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     _session: auth::AuthSession,
-    Path(id): Path<Uuid>,
+    Path(_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     Ok(Json(api::BaseItemDtoQueryResult::default()))
 }
@@ -1897,7 +1855,7 @@ pub async fn audio_universal(
     .await?
     .context_not_found("track not found")?;
 
-    state
+    let _ = state
         .ctx
         .addons
         .refresh_streams(
@@ -2086,8 +2044,8 @@ mod tests {
     use serde_json::json;
 
     use crate::integration_test::{
-        AUTH_HEADER, assert_api_keys_are_real, auth_header_with_token,
-        authenticated_server, insert_test_source, insert_test_source_of_kind,
+        assert_api_keys_are_real, auth_header_with_token, authenticated_server,
+        insert_test_source, insert_test_source_of_kind,
         insert_test_source_with_external_subtitle, new_test_server,
     };
 
@@ -2693,6 +2651,115 @@ mod tests {
         assert_eq!(response.text(), "fallback stream");
     }
 
+    #[tokio::test]
+    async fn download_without_playback_info_skips_an_error_clip_release() {
+        let upstream = httpmock::MockServer::start();
+        let mut blocked = upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/blocked");
+            then.status(307)
+                .header("Location", "/static/unavailable_for_legal_reasons.mp4");
+        });
+        for (path, body) in [
+            ("/static/unavailable_for_legal_reasons.mp4", "error clip"),
+            ("/release.mkv", "release"),
+        ] {
+            upstream.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path);
+                then.status(200)
+                    .body(body);
+            });
+        }
+
+        let (server, guard, token) = authenticated_server().await;
+        let ctx = &guard.0;
+        // An episode with two releases in stored order.
+        let item_with = async |imdb: &str, paths: [&str; 2]| {
+            let episode = crate::integration_test::seed_episode_with(
+                ctx,
+                crate::db::ExternalIds {
+                    imdb: crate::db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            for (idx, path) in paths
+                .into_iter()
+                .enumerate()
+            {
+                let mut source = insert_test_source(ctx).await;
+                source
+                    .stream_info
+                    .as_mut()
+                    .unwrap()
+                    .descriptor =
+                    crate::stream::StreamDescriptor::http(upstream.url(path));
+                source
+                    .save(&ctx.db)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE media SET parent_id = ?, idx = ? WHERE id = ?")
+                    .bind(episode.id)
+                    .bind(idx as i64)
+                    .bind(source.id)
+                    .execute(&ctx.db)
+                    .await
+                    .unwrap();
+            }
+            // Fresh streams: no addon refresh, and both rows count as current.
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(chrono::Utc::now().naive_utc() - chrono::Duration::seconds(30))
+                .bind(episode.id)
+                .execute(&ctx.db)
+                .await
+                .unwrap();
+            episode.id
+        };
+        let download = async |id: uuid::Uuid| {
+            server
+                .get(&format!("/items/{id}/download"))
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth_header_with_token(&token)).unwrap(),
+                )
+                .await
+        };
+
+        // The first release now resolves to the clip.
+        let episode = item_with("tt0306414", ["/blocked", "/release.mkv"]).await;
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "release");
+
+        // The pick holds for later (Range) requests even once the first
+        // release works again, so the client keeps getting the same file.
+        blocked.delete();
+        upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/blocked");
+            then.status(200)
+                .body("first release");
+        });
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "release");
+
+        // A release that doesn't answer the check in time, like a slow
+        // debrid resolve, isn't gone and keeps its place.
+        upstream.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/slow");
+            then.status(200)
+                .delay(std::time::Duration::from_secs(6))
+                .body("slow release");
+        });
+        let episode = item_with("tt0000002", ["/slow", "/release.mkv"]).await;
+        let response = download(episode).await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), "slow release");
+    }
+
     #[test]
     fn item_runtime_fills_missing_source_duration() {
         let mut source = crate::api::MediaSourceInfo::default();
@@ -3246,11 +3313,11 @@ mod tests {
                 play_session_id,
                 crate::playback_session::ServedPlayback::Ffmpeg {
                     video: crate::playback_session::FfmpegTrack::new(
-                        "h264",
+                        &"h264".into(),
                         Some("hevc"),
                     ),
                     audio: crate::playback_session::FfmpegTrack::new(
-                        "copy",
+                        &"copy".into(),
                         Some("aac"),
                     ),
                 },
@@ -3717,7 +3784,7 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
 
         // One movie with a single release, audio tracks in the given order.
-        let mut movie_with = async |title: &str, imdb: &str, languages: [&str; 2]| {
+        let movie_with = async |title: &str, imdb: &str, languages: [&str; 2]| {
             let mut movie = crate::db::Media {
                 title: title.to_string(),
                 external_ids: crate::db::ExternalIds {
@@ -5495,7 +5562,7 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
 
         // Groups: WEB (priority 0) and Blu-ray (priority 1)
-        let web_group = crate::db::StreamGroup::create(
+        let _web_group = crate::db::StreamGroup::create(
             &ctx.db,
             "1080p · WEB",
             StreamFilter {
