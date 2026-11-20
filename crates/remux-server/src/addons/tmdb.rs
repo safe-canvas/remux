@@ -526,7 +526,7 @@ impl From<&sdks::tmdb::Season> for db::Media {
             description: s
                 .overview
                 .clone()
-                .filter(|o| !o.is_empty()),
+                .and_then(|o| db::NonEmptyString::try_new(o).ok()),
             idx: Some(s.season_number),
             external_ids: tmdb_external_ids(
                 s.id,
@@ -569,7 +569,7 @@ impl From<&sdks::tmdb::Episode> for db::Media {
             description: ep
                 .overview
                 .clone()
-                .filter(|o| !o.is_empty()),
+                .and_then(|o| db::NonEmptyString::try_new(o).ok()),
             idx: Some(ep.episode_number),
             parent_idx: Some(ep.season_number),
             external_ids: tmdb_external_ids(
@@ -744,25 +744,22 @@ async fn tmdb_season_episodes(
         .await
         .ok()
         .and_then(|c| c.preferred_metadata_language);
-    let season_details = client
-        .execute(
-            sdks::tmdb::SeasonEndpoint {
-                series_id: series_tmdb_id,
-                season_number: season_number as i64,
-                language: preferred_language,
-                append_to_response: None,
-            }
-            .with_cache(Duration::from_secs(360)),
-        )
-        .await?;
+    let season_details = localized_season(
+        &client,
+        series_tmdb_id,
+        season_number as i64,
+        preferred_language,
+    )
+    .await?;
 
     let anchor = gp.series_canonical_key();
     let mut episodes: Vec<db::Media> = season_details
         .episodes
+        .as_deref()
         .unwrap_or_default()
-        .into_iter()
+        .iter()
         .map(|ep| {
-            let mut stub = db::Media::from(&ep);
+            let mut stub = db::Media::from(ep);
             stub.id =
                 db::Media::episode_id(&anchor, ep.season_number, ep.episode_number);
             stub.parent_id = Some(db::Media::season_id(&anchor, ep.season_number));
@@ -786,6 +783,83 @@ async fn tmdb_season_episodes(
     } else {
         Ok(Some(episodes))
     }
+}
+
+/// A season in the metadata language. TMDB answers an episode nobody
+/// translated with a made-up name ("Folge 26") and an empty overview, so an
+/// episode without an overview takes its name and overview from TMDB's
+/// default-language answer. That answer has the real name even when nobody
+/// wrote an overview yet, as for new episodes and specials. That is one more
+/// call, cached, and only for a season with such an episode.
+async fn localized_season(
+    client: &sdks::RestClient<sdks::BearerAuth>,
+    series_id: i64,
+    season_number: i64,
+    language: Option<String>,
+) -> Result<Arc<sdks::tmdb::Season>> {
+    let season = |language| {
+        client.execute_arc(
+            sdks::tmdb::SeasonEndpoint {
+                series_id,
+                season_number,
+                language,
+                append_to_response: None,
+            }
+            .with_cache(Duration::from_secs(360)),
+        )
+    };
+    let has_language = language
+        .as_deref()
+        .is_some_and(|l| !l.is_empty());
+    let localized = season(language).await?;
+    let untranslated = |e: &sdks::tmdb::Episode| {
+        e.overview
+            .as_deref()
+            .is_none_or(|o| {
+                o.trim()
+                    .is_empty()
+            })
+    };
+    if !has_language
+        || !localized
+            .episodes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(untranslated)
+    {
+        return Ok(localized);
+    }
+    let default = match season(None).await {
+        Ok(default) => default,
+        Err(e) => {
+            debug!(series_id, season_number, error = %e, "default-language season failed");
+            return Ok(localized);
+        }
+    };
+    let mut merged = (*localized).clone();
+    for episode in merged
+        .episodes
+        .iter_mut()
+        .flatten()
+        .filter(|e| untranslated(e))
+    {
+        if let Some(fallback) = default
+            .episodes
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|d| d.episode_number == episode.episode_number)
+        {
+            episode.name = fallback
+                .name
+                .clone();
+            episode.overview = fallback
+                .overview
+                .clone();
+        }
+    }
+    Ok(Arc::new(merged))
 }
 
 /// Gives each episode of a season its own TVDB and IMDb id. TMDB's season
@@ -1475,7 +1549,9 @@ async fn fetch_tmdb_meta(
                 };
                 let mut patch = db::Media {
                     title: movie_details.title,
-                    description: movie_details.overview,
+                    description: movie_details
+                        .overview
+                        .and_then(|o| db::NonEmptyString::try_new(o).ok()),
                     released_at: movie_details
                         .release_date
                         .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -1677,7 +1753,9 @@ async fn fetch_tmdb_meta(
                 };
                 let mut patch = db::Media {
                     title: tv_details.name,
-                    description: tv_details.overview,
+                    description: tv_details
+                        .overview
+                        .and_then(|o| db::NonEmptyString::try_new(o).ok()),
                     released_at: tv_details
                         .first_air_date
                         .and_then(|d| d.and_hms_opt(0, 0, 0)),
@@ -1807,19 +1885,15 @@ async fn fetch_tmdb_meta(
                 // Borrow the cached season rather than taking it by value: this runs
                 // once per episode, and copying every episode's overview/credits/
                 // guest stars just to read one of them is quadratic per season.
-                let season = client
-                    .execute_arc(
-                        sdks::tmdb::SeasonEndpoint {
-                            series_id: tmdb_id,
-                            season_number: s_n,
-                            language: config
-                                .preferred_metadata_language
-                                .clone(),
-                            append_to_response: None,
-                        }
-                        .with_cache(Duration::from_secs(360)),
-                    )
-                    .await?;
+                let season = localized_season(
+                    &client,
+                    tmdb_id,
+                    s_n,
+                    config
+                        .preferred_metadata_language
+                        .clone(),
+                )
+                .await?;
                 let Some(ep) = season
                     .episodes
                     .as_deref()
@@ -1876,7 +1950,7 @@ async fn fetch_tmdb_meta(
             let mut patch = db::Media {
                 description: details
                     .biography
-                    .filter(|b| !b.is_empty()),
+                    .and_then(|b| db::NonEmptyString::try_new(b).ok()),
                 released_at,
                 country: details
                     .place_of_birth
@@ -2833,7 +2907,8 @@ mod tests {
         assert_eq!(
             patch
                 .description
-                .as_deref(),
+                .as_deref()
+                .map(String::as_str),
             Some("From the surviving entry.")
         );
 
@@ -2943,5 +3018,122 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn season_json(episodes: &[(i64, &str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "id": 1, "season_number": 1, "name": "Season 1",
+            "episodes": episodes.iter().map(|(n, name, overview)| serde_json::json!({
+                "id": n, "name": name, "overview": overview, "season_number": 1, "episode_number": n
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    /// An episode without an overview in the metadata language takes its name
+    /// and overview from TMDB's default-language answer, also when that has no
+    /// overview either. A translated one keeps its own.
+    #[tokio::test]
+    async fn untranslated_episodes_fall_back_to_the_default_language() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/900301/season/1")
+                .query_param("language", "de");
+            then.status(200)
+                .json_body(season_json(&[
+                    (1, "Der Anfang", "Es beginnt."),
+                    (2, "Folge 2", ""),
+                    (3, "Folge 3", ""),
+                    (4, "Folge 4", ""),
+                ]));
+        });
+        let default = tmdb.mock(|when, then| {
+            when.path("/tv/900301/season/1")
+                .matches(|req| {
+                    !req.query_params
+                        .as_ref()
+                        .is_some_and(|q| {
+                            q.iter()
+                                .any(|(k, _)| k == "language")
+                        })
+                });
+            then.status(200)
+                .json_body(season_json(&[
+                    (1, "The Beginning", "It begins."),
+                    (2, "The Promise", "Subaru wakes up."),
+                    (3, "Curb Your Expectations", ""),
+                    (4, "Episode 4", ""),
+                ]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        let season = localized_season(&client, 900301, 1, Some("de".into()))
+            .await
+            .unwrap();
+        let got: Vec<(&str, Option<&str>)> = season
+            .episodes
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e.name
+                        .as_str(),
+                    e.overview
+                        .as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Der Anfang", Some("Es beginnt.")),
+                ("The Promise", Some("Subaru wakes up.")),
+                ("Curb Your Expectations", Some("")),
+                ("Episode 4", Some("")),
+            ]
+        );
+        default.assert_hits(1);
+    }
+
+    /// The default-language answer is asked only when it can help: never
+    /// without a metadata language, nor for a season fully translated.
+    #[tokio::test]
+    async fn the_default_language_is_asked_only_for_a_gap() {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/tv/900302/season/1")
+                .query_param("language", "de");
+            then.status(200)
+                .json_body(season_json(&[(1, "Der Anfang", "Es beginnt.")]));
+        });
+        let default = tmdb.mock(|when, then| {
+            when.path_contains("/tv/900302/season/1")
+                .matches(|req| {
+                    !req.query_params
+                        .as_ref()
+                        .is_some_and(|q| {
+                            q.iter()
+                                .any(|(k, _)| k == "language")
+                        })
+                });
+            then.status(200)
+                .json_body(season_json(&[(1, "Episode 1", "")]));
+        });
+        let client = tmdb_client("test", &tmdb.base_url()).unwrap();
+        localized_season(&client, 900302, 1, Some("de".into()))
+            .await
+            .unwrap();
+        default.assert_hits(0);
+        let season = localized_season(&client, 900302, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            season
+                .episodes
+                .as_deref()
+                .unwrap()[0]
+                .name,
+            "Episode 1"
+        );
+        default.assert_hits(1);
     }
 }
