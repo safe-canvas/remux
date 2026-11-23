@@ -380,9 +380,10 @@ pub struct AddonDto {
     pub config: serde_json::Value,
     /// User-enabled resources (subset of `supported_resources`).
     pub resources: Vec<ResourceType>,
-    /// User-enabled content types (subset of `supported_types`). Empty = all types enabled.
+    /// User-enabled content types (subset of `supported_types`). Absent = all
+    /// supported types, empty = none.
     #[serde(default)]
-    pub types: Vec<MediaKind>,
+    pub types: Option<Vec<MediaKind>>,
     pub enabled: bool,
     /// All resources the addon actually provides. For Stremio addons this is
     /// populated from the manifest; for other kinds it mirrors the static kind
@@ -3336,6 +3337,15 @@ pub enum ProbeOrigin {
     Ffprobe,
     RemuxDb,
     FilenameGuess,
+    /// A live HLS master playlist ffmpeg refuses by mistake, so the client
+    /// plays the provider's playlist itself: nothing is known about its
+    /// tracks. Temporary, until ffmpeg reads these playlists again
+    /// (https://github.com/FFmpeg/FFmpeg/commit/8191fa0b8c).
+    Passthrough,
+    /// An origin this build doesn't know, from a newer server or one that
+    /// dropped it, so the source still deserializes.
+    #[serde(other)]
+    Other,
 }
 
 #[dto]
@@ -3354,6 +3364,17 @@ impl MediaSourceInfo {
                 .as_ref()
                 .and_then(|r| r.source),
             Some(ProbeOrigin::FilenameGuess)
+        )
+    }
+
+    /// True when the client plays this source's playlist itself, unprobed
+    /// (see [`ProbeOrigin::Passthrough`]).
+    pub fn is_passthrough(&self) -> bool {
+        matches!(
+            self.remux
+                .as_ref()
+                .and_then(|r| r.source),
+            Some(ProbeOrigin::Passthrough)
         )
     }
 
@@ -8572,6 +8593,16 @@ impl Endpoint for RegenerateCollectionImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_probe_origin_is_other() {
+        let origin: ProbeOrigin =
+            serde_json::from_value(serde_json::json!("ffprobe")).unwrap();
+        assert_eq!(origin, ProbeOrigin::Ffprobe);
+        let origin: ProbeOrigin =
+            serde_json::from_value(serde_json::json!("something_new")).unwrap();
+        assert_eq!(origin, ProbeOrigin::Other);
+    }
 
     fn query_pairs(query: &GetItemsQuery) -> Vec<(String, String)> {
         let encoded = serde_urlencoded::to_string(query).unwrap();
